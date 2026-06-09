@@ -615,11 +615,15 @@ func (ss *ServiceSentinel) worker() {
 			ss.serviceCurrentStatusData[mh.GetId()].t = currentTime
 		}
 
-		// 写入当前数据
-		if ss.serviceCurrentStatusData[mh.GetId()].t.Before(currentTime) {
-			ss.serviceCurrentStatusData[mh.GetId()].t = currentTime.Add(30 * time.Second)
-			ss.serviceCurrentStatusData[mh.GetId()].result = append(ss.serviceCurrentStatusData[mh.GetId()].result, mh)
-		}
+// 写入当前数据
+if ss.serviceCurrentStatusData[mh.GetId()].t.Before(currentTime) {
+    sampleInterval := time.Duration(cs.Duration) * time.Second
+    if sampleInterval <= 0 {
+        sampleInterval = 30 * time.Second
+    }
+    ss.serviceCurrentStatusData[mh.GetId()].t = currentTime.Add(sampleInterval)
+    ss.serviceCurrentStatusData[mh.GetId()].result = append(ss.serviceCurrentStatusData[mh.GetId()].result, mh)
+}
 
 		// 更新当前状态
 		ss.serviceResponseDataStore[mh.GetId()] = serviceResponseData{}
