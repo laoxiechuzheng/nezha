@@ -720,7 +720,7 @@ func (ss *ServiceSentinel) worker() {
 
 		// TLS 璇佷功鎶ヨ
 		var errMsg string
-		if strings.HasPrefix(mh.Data, "SSL璇佷功閿欒锛?) {
+		if strings.HasPrefix(mh.Data, "SSL\u8bc1\u4e66\u9519\u8bef\uff1a") {
 			// i/o timeout銆乧onnection timeout銆丒OF 閿欒
 			if !strings.HasSuffix(mh.Data, "timeout") &&
 				!strings.HasSuffix(mh.Data, "EOF") &&
