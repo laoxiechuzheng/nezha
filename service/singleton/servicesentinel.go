@@ -666,7 +666,7 @@ func (ss *ServiceSentinel) worker() {
 			status.consecutiveFailures++
 
 			currentFailureIP := extractTCPFailureIP(mh.Data)
-			if !status.inFailureState && status.consecutiveFailures >= 3 {
+			if !status.inFailureState && status.consecutiveFailures >= 5 {
 				status.inFailureState = true
 				status.lastFailureIP = currentFailureIP
 				stateCode = StatusDown
@@ -705,7 +705,7 @@ func (ss *ServiceSentinel) worker() {
 		}
 
 		// State changes:
-		// - 3 consecutive failures enter Down once.
+		// - 5 consecutive failures enter Down once.
 		// - During failure, a changed resolved IP triggers one extra failure task.
 		// - 1 successful check recovers to Good once.
 		if stateCode != status.lastStatus {
