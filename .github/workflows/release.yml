@@ -39,6 +39,13 @@ jobs:
         run: |
           chmod +x ./script/fetch-frontends.sh && ./script/fetch-frontends.sh
 
+      - name: Fetch and validate IPInfo GeoIP database
+        env:
+          IPINFO_TOKEN: ${{ secrets.IPINFO_TOKEN }}
+        run: |
+          chmod +x ./script/fetch-geoip.sh
+          ./script/fetch-geoip.sh
+
       - name: Set up Go
         uses: actions/setup-go@v6
         with:

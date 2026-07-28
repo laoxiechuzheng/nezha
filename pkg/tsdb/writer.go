@@ -102,8 +102,10 @@ const (
 	MetricServerGPU            MetricType = "nezha_server_gpu"
 
 	// 服务监控指标
-	MetricServiceDelay  MetricType = "nezha_service_delay"
-	MetricServiceStatus MetricType = "nezha_service_status"
+	MetricServiceDelay      MetricType = "nezha_service_delay"
+	MetricServiceStatus     MetricType = "nezha_service_status"
+	MetricServicePacketLoss MetricType = "nezha_service_packet_loss"
+	MetricServiceErrorCode  MetricType = "nezha_service_error_code"
 )
 
 // ServerMetrics 服务器指标数据
@@ -136,6 +138,8 @@ type ServiceMetrics struct {
 	Timestamp  time.Time
 	Delay      float64
 	Successful bool
+	PacketLoss float64
+	ErrorCode  uint8
 }
 
 func (db *TSDB) WriteServerMetrics(m *ServerMetrics) error {
@@ -195,6 +199,8 @@ func (db *TSDB) WriteServiceMetrics(m *ServiceMetrics) error {
 	rows := []storage.MetricRow{
 		makeServiceMetricRow(MetricServiceDelay, serviceIDStr, serverIDStr, ts, m.Delay),
 		makeServiceMetricRow(MetricServiceStatus, serviceIDStr, serverIDStr, ts, status),
+		makeServiceMetricRow(MetricServicePacketLoss, serviceIDStr, serverIDStr, ts, m.PacketLoss),
+		makeServiceMetricRow(MetricServiceErrorCode, serviceIDStr, serverIDStr, ts, float64(m.ErrorCode)),
 	}
 
 	if db.writer != nil {
@@ -277,7 +283,7 @@ func (db *TSDB) WriteBatchServiceMetrics(metrics []*ServiceMetrics) error {
 		return fmt.Errorf("TSDB is closed")
 	}
 
-	rows := make([]storage.MetricRow, 0, len(metrics)*2)
+	rows := make([]storage.MetricRow, 0, len(metrics)*4)
 	for _, m := range metrics {
 		ts := m.Timestamp.UnixMilli()
 		serviceIDStr := strconv.FormatUint(m.ServiceID, 10)
@@ -289,6 +295,8 @@ func (db *TSDB) WriteBatchServiceMetrics(metrics []*ServiceMetrics) error {
 		rows = append(rows,
 			makeServiceMetricRow(MetricServiceDelay, serviceIDStr, serverIDStr, ts, m.Delay),
 			makeServiceMetricRow(MetricServiceStatus, serviceIDStr, serverIDStr, ts, status),
+			makeServiceMetricRow(MetricServicePacketLoss, serviceIDStr, serverIDStr, ts, m.PacketLoss),
+			makeServiceMetricRow(MetricServiceErrorCode, serviceIDStr, serverIDStr, ts, float64(m.ErrorCode)),
 		)
 	}
 

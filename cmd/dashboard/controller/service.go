@@ -154,7 +154,7 @@ func getServiceHistory(c *gin.Context) (*model.ServiceHistoryResponse, error) {
 
 	// 权限检查：未登录用户只能查看 1d 数据
 	_, isMember := c.Get(model.CtxKeyAuthorizedUser)
-	if !isMember && period != tsdb.Period1Day {
+	if !isMember && period != tsdb.Period1Day && period != tsdb.Period6Hours {
 		return nil, singleton.Localizer.ErrorT("unauthorized: only 1d data available for guests")
 	}
 
@@ -290,7 +290,7 @@ func listServerServices(c *gin.Context) ([]*model.ServiceInfos, error) {
 	}
 
 	// 权限检查：未登录用户只能查看 1d 数据
-	if !isMember && period != tsdb.Period1Day {
+	if !isMember && period != tsdb.Period1Day && period != tsdb.Period6Hours {
 		return nil, singleton.Localizer.ErrorT("unauthorized: only 1d data available for guests")
 	}
 
@@ -337,19 +337,72 @@ func listServerServices(c *gin.Context) ([]*model.ServiceInfos, error) {
 			ServiceName:  service.Name,
 			ServerName:   server.Name,
 			DisplayIndex: service.DisplayIndex,
+			Duration:     service.Duration,
 			CreatedAt:    make([]int64, len(serverStats.Stats.DataPoints)),
 			AvgDelay:     make([]float64, len(serverStats.Stats.DataPoints)),
+			PacketLoss:   make([]float64, len(serverStats.Stats.DataPoints)),
+			Status:       make([]uint8, len(serverStats.Stats.DataPoints)),
+			ErrorCode:    make([]uint8, len(serverStats.Stats.DataPoints)),
 		}
 
 		for i, dp := range serverStats.Stats.DataPoints {
 			infos.CreatedAt[i] = dp.Timestamp
 			infos.AvgDelay[i] = dp.Delay
+			infos.PacketLoss[i] = dp.PacketLoss
+			infos.Status[i] = dp.Status
+			infos.ErrorCode[i] = dp.ErrorCode
 		}
 
 		result = append(result, infos)
 	}
 
 	return result, nil
+}
+
+func listServerServiceLive(c *gin.Context) (*model.ServiceLiveResponse, error) {
+	serverID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	server, ok := singleton.ServerShared.GetList()[serverID]
+	if !ok || server == nil || !userCanViewServer(c, server) {
+		return nil, singleton.Localizer.ErrorT("server not found")
+	}
+	since, _ := strconv.ParseInt(c.DefaultQuery("since", "0"), 10, 64)
+	visibleServices := make(map[uint64]*model.Service)
+	for _, service := range singleton.ServiceSentinelShared.GetSortedList() {
+		if !userCanViewService(c, service) || !serviceCoversServer(service, serverID) {
+			continue
+		}
+		visibleServices[service.ID] = service
+	}
+	allResults := singleton.ServiceSentinelShared.RecentResultsByServer(serverID, since)
+	results := make([]model.ServiceLatestResult, 0, len(allResults))
+	for _, item := range allResults {
+		if _, ok := visibleServices[item.ServiceID]; ok {
+			results = append(results, item)
+		}
+	}
+	minDuration := int64(30000)
+	for _, service := range visibleServices {
+		duration := int64(service.Duration) * 1000
+		if duration > 0 && duration < minDuration {
+			minDuration = duration
+		}
+	}
+	if minDuration < 1000 {
+		minDuration = 1000
+	}
+	return &model.ServiceLiveResponse{
+		ServerID: serverID, ServerName: server.Name, MinDurationMs: minDuration, Results: results,
+	}, nil
+}
+
+func serviceCoversServer(service *model.Service, serverID uint64) bool {
+	if service.Cover == model.ServiceCoverAll {
+		return !service.SkipServers[serverID]
+	}
+	return service.SkipServers[serverID]
 }
 
 func queryServerServicesFromDB(serverID uint64, serverName string, period tsdb.QueryPeriod, services []*model.Service) ([]*model.ServiceInfos, error) {
@@ -389,13 +442,30 @@ func queryServerServicesFromDB(serverID uint64, serverName string, period tsdb.Q
 			ServiceName:  service.Name,
 			ServerName:   serverName,
 			DisplayIndex: service.DisplayIndex,
+			Duration:     service.Duration,
 			CreatedAt:    make([]int64, 0, len(records)),
 			AvgDelay:     make([]float64, 0, len(records)),
+			PacketLoss:   make([]float64, 0, len(records)),
+			Status:       make([]uint8, 0, len(records)),
+			ErrorCode:    make([]uint8, 0, len(records)),
 		}
 
 		for _, r := range records {
-			infos.CreatedAt = append(infos.CreatedAt, r.CreatedAt.Truncate(time.Minute).Unix()*1000)
+			infos.CreatedAt = append(infos.CreatedAt, r.CreatedAt.UnixMilli())
 			infos.AvgDelay = append(infos.AvgDelay, r.AvgDelay)
+			if r.Up > 0 {
+				infos.Status = append(infos.Status, 1)
+				infos.ErrorCode = append(infos.ErrorCode, model.ServiceErrorNone)
+			} else {
+				infos.Status = append(infos.Status, 0)
+				infos.ErrorCode = append(infos.ErrorCode, singleton.ClassifyServiceError(false, r.Data))
+			}
+			total := r.Up + r.Down
+			if total > 0 {
+				infos.PacketLoss = append(infos.PacketLoss, float64(r.Down)/float64(total)*100)
+			} else {
+				infos.PacketLoss = append(infos.PacketLoss, 0)
+			}
 		}
 
 		result = append(result, infos)
