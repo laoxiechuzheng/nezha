@@ -1,4 +1,4 @@
-﻿package singleton
+package singleton
 
 import (
 	"cmp"
@@ -55,12 +55,6 @@ type serviceTaskStatus struct {
 	lastFailureIP       string
 }
 
-type pingStore struct {
-	count        int
-	ping         float64
-	successCount int
-}
-
 /*
 浣跨敤缂撳瓨 channel锛屽鐞嗕笂鎶ョ殑 Service 璇锋眰缁撴灉锛岀劧鍚庡垽鏂槸鍚﹂渶瑕佹姤璀?
 闇€瑕佽褰曚笂涓€娆＄殑鐘舵€佷俊鎭?
@@ -78,8 +72,10 @@ type ServiceSentinel struct {
 	serviceCurrentStatusData     map[uint64]*serviceTaskStatus    // 褰撳墠浠诲姟缁撴灉缂撳瓨
 	serviceResponseDataStore     map[uint64]serviceResponseData   // 褰撳墠鏁版嵁
 
-	serviceResponsePing map[uint64]map[uint64]*pingStore // [service_id] -> ClientID -> delay
-	tlsCertCache        map[uint64]string
+	latestResultLock sync.RWMutex
+	latestResults    map[uint64]map[uint64]model.ServiceLatestResult // [service_id][server_id]
+	recentResults    map[uint64][]model.ServiceLatestResult          // [server_id], bounded live event stream
+	tlsCertCache     map[uint64]string
 
 	servicesLock    sync.RWMutex
 	serviceListLock sync.RWMutex
@@ -108,7 +104,8 @@ func NewServiceSentinel(serviceSentinelDispatchBus chan<- *model.Service) (*Serv
 		serviceStatusToday:       make(map[uint64]*_TodayStatsOfService),
 		serviceCurrentStatusData: make(map[uint64]*serviceTaskStatus),
 		serviceResponseDataStore: make(map[uint64]serviceResponseData),
-		serviceResponsePing:      make(map[uint64]map[uint64]*pingStore),
+		latestResults:            make(map[uint64]map[uint64]model.ServiceLatestResult),
+		recentResults:            make(map[uint64][]model.ServiceLatestResult),
 		services:                 make(map[uint64]*model.Service),
 		tlsCertCache:             make(map[uint64]string),
 		// 30澶╂暟鎹紦瀛?
@@ -547,61 +544,38 @@ func (ss *ServiceSentinel) worker() {
 		}
 
 		mh := r.Data
-		if mh.Type == model.TaskTypeTCPPing || mh.Type == model.TaskTypeICMPPing {
-			// TCP/ICMP Ping 浣跨敤骞冲潎鍊艰绠楀悗鍐嶅啓鍏?
-			serviceTcpMap, ok := ss.serviceResponsePing[mh.GetId()]
-			if !ok {
-				serviceTcpMap = make(map[uint64]*pingStore)
-				ss.serviceResponsePing[mh.GetId()] = serviceTcpMap
-			}
-			ts, ok := serviceTcpMap[r.Reporter]
-			if !ok {
-				ts = &pingStore{}
-			}
-			ts.count++
-			ts.ping = (ts.ping*float64(ts.count-1) + float64(mh.Delay)) / float64(ts.count)
-			if mh.Successful {
-				ts.successCount++
-			}
-			if ts.count == Conf.AvgPingCount {
-				if TSDBEnabled() {
-					if err := TSDBShared.WriteServiceMetrics(&tsdb.ServiceMetrics{
-						ServiceID:  mh.GetId(),
-						ServerID:   r.Reporter,
-						Timestamp:  time.Now(),
-						Delay:      ts.ping,
-						Successful: ts.successCount*2 >= ts.count,
-					}); err != nil {
-						log.Printf("NEZHA>> Failed to save service monitor metrics to TSDB: %v", err)
-					}
-				} else {
-					if err := DB.Create(&model.ServiceHistory{
-						ServiceID: mh.GetId(),
-						AvgDelay:  ts.ping,
-						Data:      mh.Data,
-						ServerID:  r.Reporter,
-					}).Error; err != nil {
-						log.Printf("NEZHA>> Failed to save service monitor metrics: %v", err)
-					}
-				}
-				ts.count = 0
-				ts.ping = 0
-				ts.successCount = 0
-			}
-			serviceTcpMap[r.Reporter] = ts
-		} else {
-			if TSDBEnabled() {
-				if err := TSDBShared.WriteServiceMetrics(&tsdb.ServiceMetrics{
-					ServiceID:  mh.GetId(),
-					ServerID:   r.Reporter,
-					Timestamp:  time.Now(),
-					Delay:      float64(mh.Delay),
-					Successful: mh.Successful,
-				}); err != nil {
-					log.Printf("NEZHA>> Failed to save service monitor metrics to TSDB: %v", err)
-				}
-			}
+		now := time.Now()
+		packetLoss := 100.0
+		if mh.Successful {
+			packetLoss = 0
 		}
+		if TSDBEnabled() {
+			if err := TSDBShared.WriteServiceMetrics(&tsdb.ServiceMetrics{
+				ServiceID: mh.GetId(), ServerID: r.Reporter, Timestamp: now,
+				Delay: float64(mh.Delay), Successful: mh.Successful, PacketLoss: packetLoss,
+				ErrorCode: classifyServiceError(mh.Successful, mh.Data),
+			}); err != nil {
+				log.Printf("NEZHA>> Failed to save service monitor metrics to TSDB: %v", err)
+			}
+		} else if err := DB.Create(&model.ServiceHistory{
+			ServiceID: mh.GetId(), ServerID: r.Reporter, CreatedAt: now,
+			AvgDelay: float64(mh.Delay), Data: mh.Data,
+			Up: func() uint64 {
+				if mh.Successful {
+					return 1
+				}
+				return 0
+			}(),
+			Down: func() uint64 {
+				if mh.Successful {
+					return 0
+				}
+				return 1
+			}(),
+		}).Error; err != nil {
+			log.Printf("NEZHA>> Failed to save service monitor metrics: %v", err)
+		}
+		ss.setLatestResult(cs, reporter, mh, now)
 
 		ss.serviceResponseDataStoreLock.Lock()
 		// 鍐欏叆褰撳ぉ鐘舵€?

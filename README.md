@@ -112,6 +112,21 @@ add your theme to [service/singleton/frontend-templates.yaml](service/singleton/
 ## Special Thanks
 - [IPInfo](https://ipinfo.io/) for providing an accurate GeoIP Database.
 
+### Building the dashboard with country flags
+
+The repository keeps only a `stub` GeoIP file. Before a local build, provide a free
+IPInfo token and prepare both the GeoIP database and frontend distributions:
+
+```bash
+export IPINFO_TOKEN=your_ipinfo_token
+./script/fetch-geoip.sh
+./script/fetch-frontends.sh
+```
+
+For GitHub Actions releases, add `IPINFO_TOKEN` as a repository Actions secret.
+The release workflow fails instead of publishing a dashboard without a valid
+GeoIP database.
+
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=nezhahq/nezha&type=Timeline)](https://star-history.com/#nezhahq/nezha&Timeline)

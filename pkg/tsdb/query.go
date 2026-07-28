@@ -17,6 +17,7 @@ type QueryPeriod string
 
 const (
 	Period1Day   QueryPeriod = "1d"
+	Period6Hours QueryPeriod = "6h"
 	Period7Days  QueryPeriod = "7d"
 	Period30Days QueryPeriod = "30d"
 )
@@ -26,18 +27,22 @@ func ParseQueryPeriod(s string) (QueryPeriod, error) {
 	switch s {
 	case "1d", "":
 		return Period1Day, nil
+	case "6h":
+		return Period6Hours, nil
 	case "7d":
 		return Period7Days, nil
 	case "30d":
 		return Period30Days, nil
 	default:
-		return "", fmt.Errorf("invalid period: %s, expected 1d, 7d, or 30d", s)
+		return "", fmt.Errorf("invalid period: %s, expected 6h, 1d, 7d, or 30d", s)
 	}
 }
 
 // Duration 返回时间段的时长
 func (p QueryPeriod) Duration() time.Duration {
 	switch p {
+	case Period6Hours:
+		return 6 * time.Hour
 	case Period7Days:
 		return 7 * 24 * time.Hour
 	case Period30Days:
@@ -53,6 +58,8 @@ func (p QueryPeriod) Duration() time.Duration {
 // 30d: 2小时一个点 (360个点)
 func (p QueryPeriod) DownsampleInterval() time.Duration {
 	switch p {
+	case Period6Hours:
+		return time.Millisecond
 	case Period7Days:
 		return 30 * time.Minute
 	case Period30Days:
@@ -72,11 +79,25 @@ type (
 )
 
 type rawDataPoint struct {
-	timestamp int64
-	value     float64
-	status    float64
-	hasDelay  bool
-	hasStatus bool
+	timestamp     int64
+	value         float64
+	status        float64
+	hasDelay      bool
+	hasStatus     bool
+	packetLoss    float64
+	hasPacketLoss bool
+	errorCode     uint8
+	hasErrorCode  bool
+}
+
+func (p rawDataPoint) hasReachableDelay() bool {
+	if !p.hasDelay {
+		return false
+	}
+	if p.hasPacketLoss {
+		return p.packetLoss < 100 || p.value > 0
+	}
+	return true
 }
 
 func (db *TSDB) QueryServiceHistory(serviceID uint64, period QueryPeriod) (*ServiceHistoryResult, error) {
@@ -102,6 +123,14 @@ func (db *TSDB) QueryServiceHistory(serviceID uint64, period QueryPeriod) (*Serv
 	statusData, err := db.queryMetricByServiceID(MetricServiceStatus, serviceIDStr, tr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query status data: %w", err)
+	}
+	packetLossData, err := db.queryMetricByServiceID(MetricServicePacketLoss, serviceIDStr, tr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query packet loss data: %w", err)
+	}
+	errorCodeData, err := db.queryMetricByServiceID(MetricServiceErrorCode, serviceIDStr, tr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query error code data: %w", err)
 	}
 
 	result := &ServiceHistoryResult{
@@ -141,6 +170,8 @@ func (db *TSDB) QueryServiceHistory(serviceID uint64, period QueryPeriod) (*Serv
 			}
 		}
 	}
+	mergePacketLossData(serverDataMap, packetLossData)
+	mergeErrorCodeData(serverDataMap, errorCodeData)
 
 	for serverID, pointsMap := range serverDataMap {
 		points := make([]rawDataPoint, 0, len(pointsMap))
@@ -311,7 +342,7 @@ func calculateStats(points []rawDataPoint, downsampleInterval time.Duration) Ser
 	var totalUp, totalDown uint64
 
 	for _, p := range points {
-		if p.hasDelay {
+		if p.hasReachableDelay() {
 			totalDelay += p.value
 			delayCount++
 		}
@@ -352,8 +383,9 @@ func downsample(points []rawDataPoint, interval time.Duration) []DataPoint {
 
 	// points 已排序，线性扫描分桶
 	bucketStart := (points[0].timestamp / intervalMs) * intervalMs
-	var totalDelay float64
-	var delayCount, upCount, statusCount int
+	var totalDelay, totalPacketLoss float64
+	var delayCount, upCount, statusCount, packetLossCount int
+	var errorCode uint8
 
 	flushBucket := func() {
 		var avgDelay float64
@@ -361,13 +393,24 @@ func downsample(points []rawDataPoint, interval time.Duration) []DataPoint {
 			avgDelay = totalDelay / float64(delayCount)
 		}
 		var status uint8
-		if statusCount > 0 && upCount > statusCount/2 {
+		// A bucket is healthy only when every probe succeeded. This preserves
+		// short outages in downsampled 1d/7d/30d views instead of hiding them
+		// behind a majority of successful probes.
+		if statusCount > 0 && upCount == statusCount {
 			status = 1
 		}
+		var packetLoss float64
+		if packetLossCount > 0 {
+			packetLoss = totalPacketLoss / float64(packetLossCount)
+		} else if statusCount > 0 {
+			packetLoss = float64(statusCount-upCount) / float64(statusCount) * 100
+		}
 		result = append(result, DataPoint{
-			Timestamp: bucketStart,
-			Delay:     avgDelay,
-			Status:    status,
+			Timestamp:  bucketStart,
+			Delay:      avgDelay,
+			Status:     status,
+			PacketLoss: packetLoss,
+			ErrorCode:  errorCode,
 		})
 	}
 
@@ -380,8 +423,11 @@ func downsample(points []rawDataPoint, interval time.Duration) []DataPoint {
 			delayCount = 0
 			upCount = 0
 			statusCount = 0
+			totalPacketLoss = 0
+			packetLossCount = 0
+			errorCode = 0
 		}
-		if p.hasDelay {
+		if p.hasReachableDelay() {
 			totalDelay += p.value
 			delayCount++
 		}
@@ -390,6 +436,13 @@ func downsample(points []rawDataPoint, interval time.Duration) []DataPoint {
 			if p.status >= 0.5 {
 				upCount++
 			}
+		}
+		if p.hasPacketLoss {
+			totalPacketLoss += p.packetLoss
+			packetLossCount++
+		}
+		if p.hasErrorCode && p.errorCode != model.ServiceErrorNone {
+			errorCode = p.errorCode
 		}
 	}
 	flushBucket()
@@ -540,6 +593,14 @@ func (db *TSDB) QueryServiceHistoryByServerID(serverID uint64, period QueryPerio
 	if err != nil {
 		return nil, fmt.Errorf("failed to query status data: %w", err)
 	}
+	packetLossData, err := db.queryMetricByServerID(MetricServicePacketLoss, serverIDStr, tr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query packet loss data: %w", err)
+	}
+	errorCodeData, err := db.queryMetricByServerID(MetricServiceErrorCode, serverIDStr, tr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query error code data: %w", err)
+	}
 
 	serviceDataMap := make(map[uint64]map[int64]*rawDataPoint)
 
@@ -573,6 +634,8 @@ func (db *TSDB) QueryServiceHistoryByServerID(serverID uint64, period QueryPerio
 			}
 		}
 	}
+	mergePacketLossData(serviceDataMap, packetLossData)
+	mergeErrorCodeData(serviceDataMap, errorCodeData)
 
 	results := make(map[uint64]*ServiceHistoryResult)
 
@@ -661,4 +724,43 @@ func (db *TSDB) queryMetricByServerID(metric MetricType, serverID string, tr sto
 	}
 
 	return result, nil
+}
+
+func mergePacketLossData(target map[uint64]map[int64]*rawDataPoint, source map[uint64][]metricPoint) {
+	for id, points := range source {
+		if target[id] == nil {
+			target[id] = make(map[int64]*rawDataPoint)
+		}
+		for _, p := range points {
+			if existing, ok := target[id][p.timestamp]; ok {
+				existing.packetLoss = p.value
+				existing.hasPacketLoss = true
+			} else {
+				target[id][p.timestamp] = &rawDataPoint{
+					timestamp:     p.timestamp,
+					packetLoss:    p.value,
+					hasPacketLoss: true,
+				}
+			}
+		}
+	}
+}
+
+func mergeErrorCodeData(target map[uint64]map[int64]*rawDataPoint, source map[uint64][]metricPoint) {
+	for id, points := range source {
+		if target[id] == nil {
+			target[id] = make(map[int64]*rawDataPoint)
+		}
+		for _, p := range points {
+			errorCode := uint8(p.value)
+			if existing, ok := target[id][p.timestamp]; ok {
+				existing.errorCode = errorCode
+				existing.hasErrorCode = true
+			} else {
+				target[id][p.timestamp] = &rawDataPoint{
+					timestamp: p.timestamp, errorCode: errorCode, hasErrorCode: true,
+				}
+			}
+		}
+	}
 }

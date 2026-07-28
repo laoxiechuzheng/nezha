@@ -16,7 +16,7 @@ func TestConfig_Defaults(t *testing.T) {
 	assert.Equal(t, "", config.DataPath) // 默认为空，不启用 TSDB
 	assert.Equal(t, uint16(30), config.RetentionDays)
 	assert.Equal(t, float64(1), config.MinFreeDiskSpaceGB)
-	assert.Equal(t, 30*time.Second, config.DedupInterval)
+	assert.Equal(t, time.Millisecond, config.DedupInterval)
 	assert.False(t, config.Enabled())
 }
 
@@ -243,15 +243,49 @@ func TestQueryPeriod_Parse(t *testing.T) {
 }
 
 func TestQueryPeriod_Duration(t *testing.T) {
+	assert.Equal(t, 6*time.Hour, Period6Hours.Duration())
 	assert.Equal(t, 24*time.Hour, Period1Day.Duration())
 	assert.Equal(t, 7*24*time.Hour, Period7Days.Duration())
 	assert.Equal(t, 30*24*time.Hour, Period30Days.Duration())
 }
 
 func TestQueryPeriod_DownsampleInterval(t *testing.T) {
+	assert.Equal(t, time.Millisecond, Period6Hours.DownsampleInterval())
 	assert.Equal(t, 30*time.Second, Period1Day.DownsampleInterval())
 	assert.Equal(t, 30*time.Minute, Period7Days.DownsampleInterval())
 	assert.Equal(t, 2*time.Hour, Period30Days.DownsampleInterval())
+}
+
+func TestTSDB_QueryServiceHistory6HoursPreservesEveryProbe(t *testing.T) {
+	tempDir := t.TempDir()
+	db, err := Open(&Config{
+		DataPath: filepath.Join(tempDir, "tsdb"), RetentionDays: 1,
+		MinFreeDiskSpaceGB: 1, DedupInterval: time.Millisecond,
+	})
+	require.NoError(t, err)
+	defer db.Close()
+
+	now := time.Now().Truncate(time.Millisecond)
+	probes := []*ServiceMetrics{
+		{ServiceID: 10, ServerID: 20, Timestamp: now.Add(-10 * time.Second), Delay: 21, Successful: true},
+		{ServiceID: 10, ServerID: 20, Timestamp: now.Add(-5 * time.Second), Successful: false, PacketLoss: 100, ErrorCode: 1},
+		{ServiceID: 10, ServerID: 20, Timestamp: now, Delay: 23, Successful: true},
+	}
+	for _, probe := range probes {
+		require.NoError(t, db.WriteServiceMetrics(probe))
+	}
+	db.Flush()
+
+	result, err := db.QueryServiceHistory(10, Period6Hours)
+	require.NoError(t, err)
+	require.Len(t, result.Servers, 1)
+	points := result.Servers[0].Stats.DataPoints
+	require.Len(t, points, 3)
+	assert.Equal(t, []int64{probes[0].Timestamp.UnixMilli(), probes[1].Timestamp.UnixMilli(), probes[2].Timestamp.UnixMilli()},
+		[]int64{points[0].Timestamp, points[1].Timestamp, points[2].Timestamp})
+	assert.Equal(t, []uint8{1, 0, 1}, []uint8{points[0].Status, points[1].Status, points[2].Status})
+	assert.Equal(t, 100.0, points[1].PacketLoss)
+	assert.Equal(t, uint8(1), points[1].ErrorCode)
 }
 
 func TestTSDB_QueryServiceHistory(t *testing.T) {
@@ -463,6 +497,21 @@ func TestCalculateStats_ZeroDelay(t *testing.T) {
 
 	assert.Equal(t, float64(5), stats.AvgDelay)
 	assert.Equal(t, uint64(2), stats.TotalUp)
+}
+
+func TestDownsampleReportsActualPacketLoss(t *testing.T) {
+	points := []rawDataPoint{
+		{timestamp: 1000, value: 10, status: 1, hasDelay: true, hasStatus: true, packetLoss: 0, hasPacketLoss: true},
+		{timestamp: 2000, value: 20, status: 1, hasDelay: true, hasStatus: true, packetLoss: 0, hasPacketLoss: true},
+		{timestamp: 3000, value: 30, status: 1, hasDelay: true, hasStatus: true, packetLoss: 0, hasPacketLoss: true},
+		{timestamp: 4000, value: 0, status: 0, hasDelay: true, hasStatus: true, packetLoss: 100, hasPacketLoss: true},
+	}
+
+	result := downsample(points, time.Minute)
+	require.Len(t, result, 1)
+	assert.InDelta(t, 25.0, result[0].PacketLoss, 0.001)
+	assert.InDelta(t, 20.0, result[0].Delay, 0.001)
+	assert.Equal(t, uint8(0), result[0].Status, "one failed probe must keep the outage visible")
 }
 
 func TestCalculateStatsEmpty(t *testing.T) {

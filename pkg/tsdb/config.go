@@ -13,7 +13,7 @@ type Config struct {
 	MinFreeDiskSpaceGB float64 `koanf:"min_free_disk_space_gb" json:"min_free_disk_space_gb,omitempty"`
 	// MaxMemoryMB 最大内存使用量(MB)，默认 256MB，用于限制 VictoriaMetrics 缓存
 	MaxMemoryMB int64 `koanf:"max_memory_mb" json:"max_memory_mb,omitempty"`
-	// DedupInterval 去重间隔，默认 30 秒
+	// DedupInterval 去重间隔，默认 1 毫秒，确保服务监控的每次 Agent 回报都被保留
 	DedupInterval time.Duration `koanf:"dedup_interval" json:"dedup_interval,omitempty"`
 	// WriteBufferSize 写入缓冲区大小，默认 512，达到此数量后批量写入
 	WriteBufferSize int `koanf:"write_buffer_size" json:"write_buffer_size,omitempty"`
@@ -28,7 +28,7 @@ func DefaultConfig() *Config {
 		RetentionDays:            30,
 		MinFreeDiskSpaceGB:       1,
 		MaxMemoryMB:              256,
-		DedupInterval:            30 * time.Second,
+		DedupInterval:            time.Millisecond,
 		WriteBufferSize:          512,
 		WriteBufferFlushInterval: 5 * time.Second,
 	}
@@ -46,7 +46,7 @@ func (c *Config) Validate() {
 		c.MaxMemoryMB = 256
 	}
 	if c.DedupInterval <= 0 {
-		c.DedupInterval = 30 * time.Second
+		c.DedupInterval = time.Millisecond
 	}
 	if c.WriteBufferSize <= 0 {
 		c.WriteBufferSize = 512
