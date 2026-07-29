@@ -573,7 +573,8 @@ func TestDownsampleReportsActualPacketLoss(t *testing.T) {
 	result := downsample(points, time.Minute)
 	require.Len(t, result, 1)
 	assert.InDelta(t, 25.0, result[0].PacketLoss, 0.001)
-	assert.InDelta(t, 20.0, result[0].Delay, 0.001)
+	assert.Equal(t, int64(4000), result[0].Timestamp)
+	assert.InDelta(t, 0.0, result[0].Delay, 0.001)
 	assert.Equal(t, uint8(0), result[0].Status, "one failed probe must keep the outage visible")
 }
 
