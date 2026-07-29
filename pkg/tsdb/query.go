@@ -371,11 +371,58 @@ func calculateStats(points []rawDataPoint, downsampleInterval time.Duration) Ser
 	}
 
 	summary.DataPoints = downsample(points, downsampleInterval)
-	if downsampleInterval <= time.Millisecond {
-		summary.DataPoints = compactServiceChartPoints(summary.DataPoints, maxServiceChartPoints)
+	if downsampleInterval > time.Millisecond {
+		summary.DataPoints = mergeServiceTransitions(summary.DataPoints, points)
 	}
+	summary.DataPoints = compactServiceChartPoints(summary.DataPoints, maxServiceChartPoints)
 
 	return summary
+}
+
+func mergeServiceTransitions(sampled []DataPoint, raw []rawDataPoint) []DataPoint {
+	byTimestamp := make(map[int64]DataPoint, len(sampled))
+	for _, point := range sampled {
+		byTimestamp[point.Timestamp] = point
+	}
+
+	appendRaw := func(point rawDataPoint) {
+		status := uint8(1)
+		if point.hasStatus && point.status < 0.5 {
+			status = 0
+		}
+		packetLoss := point.packetLoss
+		if !point.hasPacketLoss && status == 0 {
+			packetLoss = 100
+		}
+		byTimestamp[point.timestamp] = DataPoint{
+			Timestamp:  point.timestamp,
+			Delay:      point.value,
+			Status:     status,
+			PacketLoss: packetLoss,
+			ErrorCode:  point.errorCode,
+		}
+	}
+
+	for i := 1; i < len(raw); i++ {
+		if !raw[i-1].hasStatus || !raw[i].hasStatus {
+			continue
+		}
+		previousStatus := raw[i-1].status >= 0.5
+		currentStatus := raw[i].status >= 0.5
+		if previousStatus != currentStatus {
+			appendRaw(raw[i-1])
+			appendRaw(raw[i])
+		}
+	}
+
+	result := make([]DataPoint, 0, len(byTimestamp))
+	for _, point := range byTimestamp {
+		result = append(result, point)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Timestamp < result[j].Timestamp
+	})
+	return result
 }
 
 // compactServiceChartPoints selects real probe samples for the browser chart.
@@ -440,15 +487,18 @@ func downsample(points []rawDataPoint, interval time.Duration) []DataPoint {
 
 	// points 已排序，线性扫描分桶
 	bucketStart := (points[0].timestamp / intervalMs) * intervalMs
-	var totalDelay, totalPacketLoss float64
-	var delayCount, upCount, statusCount, packetLossCount int
+	var totalPacketLoss float64
+	var upCount, statusCount, packetLossCount int
 	var errorCode uint8
+	var representative rawDataPoint
+	var hasRepresentative bool
+	var firstHealthy rawDataPoint
+	var hasHealthy bool
+	var firstFailure rawDataPoint
+	var hasFailure bool
+	var previousStatus uint8 = 1
 
 	flushBucket := func() {
-		var avgDelay float64
-		if delayCount > 0 {
-			avgDelay = totalDelay / float64(delayCount)
-		}
 		var status uint8
 		// A bucket is healthy only when every probe succeeded. This preserves
 		// short outages in downsampled 1d/7d/30d views instead of hiding them
@@ -462,13 +512,27 @@ func downsample(points []rawDataPoint, interval time.Duration) []DataPoint {
 		} else if statusCount > 0 {
 			packetLoss = float64(statusCount-upCount) / float64(statusCount) * 100
 		}
+		selected := representative
+		if status == 0 && hasFailure {
+			selected = firstFailure
+		} else if previousStatus == 0 && status == 1 && hasHealthy {
+			// The first healthy probe gives a truthful recovery timestamp.
+			selected = firstHealthy
+		}
+		timestamp := bucketStart
+		var delay float64
+		if hasRepresentative || hasFailure {
+			timestamp = selected.timestamp
+			delay = selected.value
+		}
 		result = append(result, DataPoint{
-			Timestamp:  bucketStart,
-			Delay:      avgDelay,
+			Timestamp:  timestamp,
+			Delay:      delay,
 			Status:     status,
 			PacketLoss: packetLoss,
 			ErrorCode:  errorCode,
 		})
+		previousStatus = status
 	}
 
 	for _, p := range points {
@@ -476,22 +540,33 @@ func downsample(points []rawDataPoint, interval time.Duration) []DataPoint {
 		if key != bucketStart {
 			flushBucket()
 			bucketStart = key
-			totalDelay = 0
-			delayCount = 0
+			representative = rawDataPoint{}
+			hasRepresentative = false
+			firstHealthy = rawDataPoint{}
+			hasHealthy = false
+			firstFailure = rawDataPoint{}
+			hasFailure = false
 			upCount = 0
 			statusCount = 0
 			totalPacketLoss = 0
 			packetLossCount = 0
 			errorCode = 0
 		}
-		if p.hasReachableDelay() {
-			totalDelay += p.value
-			delayCount++
+		if p.hasReachableDelay() && (!hasRepresentative || p.value > representative.value) {
+			representative = p
+			hasRepresentative = true
 		}
 		if p.hasStatus {
 			statusCount++
 			if p.status >= 0.5 {
 				upCount++
+				if !hasHealthy {
+					firstHealthy = p
+					hasHealthy = true
+				}
+			} else if !hasFailure {
+				firstFailure = p
+				hasFailure = true
 			}
 		}
 		if p.hasPacketLoss {

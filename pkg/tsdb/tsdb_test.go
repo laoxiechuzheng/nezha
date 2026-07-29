@@ -318,6 +318,39 @@ func TestCompactServiceChartPointsPreservesRealOutageTransitions(t *testing.T) {
 	}
 }
 
+func TestServiceChartDownsamplingUsesRealSamples(t *testing.T) {
+	healthy := []rawDataPoint{
+		{timestamp: 1000, value: 10, status: 1, hasDelay: true, hasStatus: true},
+		{timestamp: 5000, value: 40, status: 1, hasDelay: true, hasStatus: true},
+		{timestamp: 9000, value: 20, status: 1, hasDelay: true, hasStatus: true},
+	}
+	healthyPoints := downsample(healthy, 30*time.Second)
+	require.Len(t, healthyPoints, 1)
+	assert.Equal(t, int64(5000), healthyPoints[0].Timestamp)
+	assert.Equal(t, 40.0, healthyPoints[0].Delay)
+	assert.NotEqual(t, (10.0+40.0+20.0)/3.0, healthyPoints[0].Delay)
+
+	withOutage := []rawDataPoint{
+		{timestamp: 1000, value: 10, status: 1, hasDelay: true, hasStatus: true},
+		{timestamp: 5000, value: 12, status: 1, hasDelay: true, hasStatus: true},
+		{timestamp: 10000, status: 0, hasStatus: true, errorCode: 1, hasErrorCode: true},
+		{timestamp: 15000, status: 0, hasStatus: true, errorCode: 1, hasErrorCode: true},
+		{timestamp: 20000, value: 11, status: 1, hasDelay: true, hasStatus: true},
+	}
+	sampled := downsample(withOutage, 30*time.Second)
+	merged := mergeServiceTransitions(sampled, withOutage)
+	byTimestamp := make(map[int64]DataPoint, len(merged))
+	for _, point := range merged {
+		byTimestamp[point.Timestamp] = point
+	}
+	for _, timestamp := range []int64{5000, 10000, 15000, 20000} {
+		_, ok := byTimestamp[timestamp]
+		require.True(t, ok, "real transition sample %d must be preserved", timestamp)
+	}
+	assert.Equal(t, uint8(0), byTimestamp[10000].Status)
+	assert.Equal(t, uint8(1), byTimestamp[20000].Status)
+}
+
 func TestTSDB_QueryServiceHistory(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "tsdb_test")
 	require.NoError(t, err)
