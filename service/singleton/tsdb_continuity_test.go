@@ -19,7 +19,7 @@ func TestInitTSDBPreservesLegacyServiceHistory(t *testing.T) {
 	require.NoError(t, DB.Create(&model.ServiceHistory{ServiceID: 1, ServerID: 2, AvgDelay: 10, Up: 1}).Error)
 
 	originalConf := Conf
-	Conf = &model.Config{}
+	Conf = &ConfigClass{}
 	Conf.TSDB.DataPath = filepath.Join(t.TempDir(), "tsdb")
 	t.Cleanup(func() {
 		CloseTSDB()
