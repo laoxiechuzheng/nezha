@@ -36,11 +36,14 @@ func InitTSDB() error {
 		config.WriteBufferFlushInterval = time.Duration(Conf.TSDB.WriteBufferFlushInterval) * time.Second
 	}
 
+	if DB != nil {
+		if err := DB.AutoMigrate(model.ServiceHistory{}); err != nil {
+			return err
+		}
+	}
+
 	if !config.Enabled() {
 		log.Println("NEZHA>> TSDB is disabled (tsdb.data_path not configured)")
-		if DB != nil {
-			return DB.AutoMigrate(model.ServiceHistory{})
-		}
 		return nil
 	}
 
@@ -52,12 +55,7 @@ func InitTSDB() error {
 
 	log.Println("NEZHA>> TSDB initialized successfully")
 
-	if DB != nil && DB.Migrator().HasTable("service_histories") {
-		log.Println("NEZHA>> Dropping legacy service_histories table (TSDB is now enabled). Historical data will NOT be migrated.")
-		if err := DB.Migrator().DropTable("service_histories"); err != nil {
-			log.Printf("NEZHA>> Warning: failed to drop service_histories table: %v", err)
-		}
-	}
+	log.Println("NEZHA>> SQLite service history fallback enabled for restart-safe continuity")
 
 	return nil
 }

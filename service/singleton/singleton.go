@@ -196,6 +196,14 @@ func PerformMaintenance() {
 
 	// 1. SQLite 维护
 	if DB != nil {
+		retentionDays := 30
+		if Conf != nil && Conf.TSDB.RetentionDays > 0 {
+			retentionDays = int(Conf.TSDB.RetentionDays)
+		}
+		cutoff := time.Now().AddDate(0, 0, -retentionDays)
+		if err := DB.Where("created_at < ?", cutoff).Delete(&model.ServiceHistory{}).Error; err != nil {
+			log.Printf("NEZHA>> SQLite: service history retention cleanup failed: %v", err)
+		}
 		log.Println("NEZHA>> SQLite: Starting VACUUM...")
 		if err := DB.Exec("VACUUM").Error; err != nil {
 			log.Printf("NEZHA>> SQLite: VACUUM failed: %v", err)

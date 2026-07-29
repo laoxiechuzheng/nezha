@@ -312,6 +312,14 @@ func listServerServices(c *gin.Context) ([]*model.ServiceInfos, error) {
 	if err != nil {
 		return nil, err
 	}
+	legacyResults, err := queryServerServicesFromDB(serverID, server.Name, period, services)
+	if err != nil {
+		return nil, err
+	}
+	legacyByService := make(map[uint64]*model.ServiceInfos, len(legacyResults))
+	for _, item := range legacyResults {
+		legacyByService[item.ServiceID] = item
+	}
 
 	for _, service := range services {
 		if service.Cover == model.ServiceCoverAll {
@@ -326,6 +334,9 @@ func listServerServices(c *gin.Context) ([]*model.ServiceInfos, error) {
 
 		historyResult, ok := historyResults[service.ID]
 		if !ok || len(historyResult.Servers) == 0 {
+			if legacy, exists := legacyByService[service.ID]; exists {
+				result = append(result, legacy)
+			}
 			continue
 		}
 
@@ -352,11 +363,60 @@ func listServerServices(c *gin.Context) ([]*model.ServiceInfos, error) {
 			infos.Status[i] = dp.Status
 			infos.ErrorCode[i] = dp.ErrorCode
 		}
+		if legacy, exists := legacyByService[service.ID]; exists {
+			infos = mergeServiceInfos(legacy, infos)
+		}
 
 		result = append(result, infos)
 	}
 
 	return result, nil
+}
+
+func mergeServiceInfos(older, newer *model.ServiceInfos) *model.ServiceInfos {
+	if older == nil {
+		return newer
+	}
+	if newer == nil {
+		return older
+	}
+	type point struct {
+		delay      float64
+		packetLoss float64
+		status     uint8
+		errorCode  uint8
+	}
+	points := make(map[int64]point, len(older.CreatedAt)+len(newer.CreatedAt))
+	add := func(source *model.ServiceInfos) {
+		for i, timestamp := range source.CreatedAt {
+			p := point{}
+			if i < len(source.AvgDelay) { p.delay = source.AvgDelay[i] }
+			if i < len(source.PacketLoss) { p.packetLoss = source.PacketLoss[i] }
+			if i < len(source.Status) { p.status = source.Status[i] }
+			if i < len(source.ErrorCode) { p.errorCode = source.ErrorCode[i] }
+			points[timestamp] = p
+		}
+	}
+	add(older)
+	add(newer)
+	timestamps := make([]int64, 0, len(points))
+	for timestamp := range points { timestamps = append(timestamps, timestamp) }
+	slices.Sort(timestamps)
+	merged := *newer
+	merged.CreatedAt = make([]int64, 0, len(timestamps))
+	merged.AvgDelay = make([]float64, 0, len(timestamps))
+	merged.PacketLoss = make([]float64, 0, len(timestamps))
+	merged.Status = make([]uint8, 0, len(timestamps))
+	merged.ErrorCode = make([]uint8, 0, len(timestamps))
+	for _, timestamp := range timestamps {
+		p := points[timestamp]
+		merged.CreatedAt = append(merged.CreatedAt, timestamp)
+		merged.AvgDelay = append(merged.AvgDelay, p.delay)
+		merged.PacketLoss = append(merged.PacketLoss, p.packetLoss)
+		merged.Status = append(merged.Status, p.status)
+		merged.ErrorCode = append(merged.ErrorCode, p.errorCode)
+	}
+	return &merged
 }
 
 func listServerServiceLive(c *gin.Context) (*model.ServiceLiveResponse, error) {
