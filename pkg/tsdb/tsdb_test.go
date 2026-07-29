@@ -288,6 +288,36 @@ func TestTSDB_QueryServiceHistory6HoursPreservesEveryProbe(t *testing.T) {
 	assert.Equal(t, uint8(1), points[1].ErrorCode)
 }
 
+func TestCompactServiceChartPointsPreservesRealOutageTransitions(t *testing.T) {
+	points := make([]DataPoint, 5000)
+	for i := range points {
+		status := uint8(1)
+		if i >= 2000 && i < 2100 {
+			status = 0
+		}
+		points[i] = DataPoint{
+			Timestamp: int64(i * 5000),
+			Delay:     float64(i % 100),
+			Status:    status,
+		}
+	}
+
+	compacted := compactServiceChartPoints(points, 720)
+	assert.LessOrEqual(t, len(compacted), 720)
+	assert.Equal(t, points[0], compacted[0])
+	assert.Equal(t, points[len(points)-1], compacted[len(compacted)-1])
+
+	byTimestamp := make(map[int64]DataPoint, len(compacted))
+	for _, point := range compacted {
+		byTimestamp[point.Timestamp] = point
+	}
+	for _, index := range []int{1999, 2000, 2099, 2100} {
+		actual, ok := byTimestamp[points[index].Timestamp]
+		require.True(t, ok, "transition point %d must be preserved", index)
+		assert.Equal(t, points[index], actual)
+	}
+}
+
 func TestTSDB_QueryServiceHistory(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "tsdb_test")
 	require.NoError(t, err)

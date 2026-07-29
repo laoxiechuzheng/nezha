@@ -90,6 +90,8 @@ type rawDataPoint struct {
 	hasErrorCode  bool
 }
 
+const maxServiceChartPoints = 720
+
 func (p rawDataPoint) hasReachableDelay() bool {
 	if !p.hasDelay {
 		return false
@@ -369,8 +371,63 @@ func calculateStats(points []rawDataPoint, downsampleInterval time.Duration) Ser
 	}
 
 	summary.DataPoints = downsample(points, downsampleInterval)
+	if downsampleInterval <= time.Millisecond {
+		summary.DataPoints = compactServiceChartPoints(summary.DataPoints, maxServiceChartPoints)
+	}
 
 	return summary
+}
+
+// compactServiceChartPoints selects real probe samples for the browser chart.
+// It never averages or invents latency values and always keeps outage/recovery
+// transitions, so the full-resolution TSDB data remains untouched while 6h
+// responses stay small enough to render promptly on phones.
+func compactServiceChartPoints(points []DataPoint, maxPoints int) []DataPoint {
+	if maxPoints < 2 || len(points) <= maxPoints {
+		return points
+	}
+
+	mandatory := map[int]struct{}{0: {}, len(points) - 1: {}}
+	for i := 1; i < len(points); i++ {
+		if points[i].Status != points[i-1].Status {
+			mandatory[i-1] = struct{}{}
+			mandatory[i] = struct{}{}
+		}
+	}
+
+	remaining := maxPoints - len(mandatory)
+	if remaining > 0 {
+		bucketSize := float64(len(points)) / float64(remaining)
+		for bucket := 0; bucket < remaining; bucket++ {
+			from := int(float64(bucket) * bucketSize)
+			to := int(float64(bucket+1) * bucketSize)
+			if to <= from {
+				to = from + 1
+			}
+			if to > len(points) {
+				to = len(points)
+			}
+			representative := from
+			for i := from + 1; i < to; i++ {
+				if points[i].Delay > points[representative].Delay {
+					representative = i
+				}
+			}
+			mandatory[representative] = struct{}{}
+		}
+	}
+
+	indices := make([]int, 0, len(mandatory))
+	for index := range mandatory {
+		indices = append(indices, index)
+	}
+	sort.Ints(indices)
+
+	result := make([]DataPoint, 0, len(indices))
+	for _, index := range indices {
+		result = append(result, points[index])
+	}
+	return result
 }
 
 func downsample(points []rawDataPoint, interval time.Duration) []DataPoint {
