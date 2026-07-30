@@ -528,11 +528,104 @@ func queryServerServicesFromDB(serverID uint64, serverName string, period tsdb.Q
 			}
 		}
 
+		compactServiceInfos(infos, 720)
+
 		result = append(result, infos)
 	}
 
 	return result, nil
 }
+
+// compactServiceInfos reduces the number of data points in a ServiceInfos to at most maxPoints.
+// It preserves first, last, and status-transition points, then bucket-samples the rest.
+func compactServiceInfos(infos *model.ServiceInfos, maxPoints int) {
+	n := len(infos.CreatedAt)
+	if n <= maxPoints || n < 3 || maxPoints < 3 {
+		return
+	}
+
+	mandatory := make(map[int]struct{}, maxPoints*2)
+	mandatory[0] = struct{}{}
+	mandatory[n-1] = struct{}{}
+	for i := 1; i < n; i++ {
+		if i < len(infos.Status) && i-1 < len(infos.Status) {
+			if infos.Status[i] != infos.Status[i-1] {
+				mandatory[i-1] = struct{}{}
+				mandatory[i] = struct{}{}
+			}
+		}
+	}
+
+	remaining := maxPoints - len(mandatory)
+	if remaining > 0 {
+		bucketSize := float64(n) / float64(remaining)
+		for bucket := 0; bucket < remaining; bucket++ {
+			from := int(float64(bucket) * bucketSize)
+			to := int(float64(bucket+1) * bucketSize)
+			if to <= from {
+				to = from + 1
+			}
+			if to > n {
+				to = n
+			}
+			representative := from
+			for i := from + 1; i < to; i++ {
+				var curDelay, repDelay float64
+				if representative < len(infos.AvgDelay) {
+					repDelay = infos.AvgDelay[representative]
+				}
+				if i < len(infos.AvgDelay) {
+					curDelay = infos.AvgDelay[i]
+				}
+				if curDelay > repDelay {
+					representative = i
+				}
+			}
+			mandatory[representative] = struct{}{}
+		}
+	}
+
+	indices := make([]int, 0, len(mandatory))
+	for index := range mandatory {
+		indices = append(indices, index)
+	}
+	slices.Sort(indices)
+
+	newCreatedAt := make([]int64, 0, len(indices))
+	newAvgDelay := make([]float64, 0, len(indices))
+	newPacketLoss := make([]float64, 0, len(indices))
+	newStatus := make([]uint8, 0, len(indices))
+	newErrorCode := make([]uint8, 0, len(indices))
+	for _, idx := range indices {
+		newCreatedAt = append(newCreatedAt, infos.CreatedAt[idx])
+		if idx < len(infos.AvgDelay) {
+			newAvgDelay = append(newAvgDelay, infos.AvgDelay[idx])
+		} else {
+			newAvgDelay = append(newAvgDelay, 0)
+		}
+		if idx < len(infos.PacketLoss) {
+			newPacketLoss = append(newPacketLoss, infos.PacketLoss[idx])
+		} else {
+			newPacketLoss = append(newPacketLoss, 0)
+		}
+		if idx < len(infos.Status) {
+			newStatus = append(newStatus, infos.Status[idx])
+		} else {
+			newStatus = append(newStatus, 1)
+		}
+		if idx < len(infos.ErrorCode) {
+			newErrorCode = append(newErrorCode, infos.ErrorCode[idx])
+		} else {
+			newErrorCode = append(newErrorCode, 0)
+		}
+	}
+	infos.CreatedAt = newCreatedAt
+	infos.AvgDelay = newAvgDelay
+	infos.PacketLoss = newPacketLoss
+	infos.Status = newStatus
+	infos.ErrorCode = newErrorCode
+}
+
 
 // List server with service
 // @Summary List server with service

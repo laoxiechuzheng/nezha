@@ -90,7 +90,7 @@ type rawDataPoint struct {
 	hasErrorCode  bool
 }
 
-const maxServiceChartPoints = 720
+const maxServiceChartPoints = 1200
 
 func (p rawDataPoint) hasReachableDelay() bool {
 	if !p.hasDelay {
