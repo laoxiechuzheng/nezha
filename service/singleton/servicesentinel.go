@@ -55,6 +55,16 @@ type serviceTaskStatus struct {
 	lastFailureIP       string
 }
 
+type serviceHistoryCheckpointKey struct {
+	serviceID uint64
+	serverID  uint64
+}
+
+type serviceHistoryCheckpoint struct {
+	writtenAt  time.Time
+	successful bool
+}
+
 /*
 浣跨敤缂撳瓨 channel锛屽鐞嗕笂鎶ョ殑 Service 璇锋眰缁撴灉锛岀劧鍚庡垽鏂槸鍚﹂渶瑕佹姤璀?
 闇€瑕佽褰曚笂涓€娆＄殑鐘舵€佷俊鎭?
@@ -76,6 +86,9 @@ type ServiceSentinel struct {
 	latestResults    map[uint64]map[uint64]model.ServiceLatestResult // [service_id][server_id]
 	recentResults    map[uint64][]model.ServiceLatestResult          // [server_id], bounded live event stream
 	tlsCertCache     map[uint64]string
+
+	historyCheckpointLock sync.Mutex
+	historyCheckpoints    map[serviceHistoryCheckpointKey]serviceHistoryCheckpoint
 
 	servicesLock    sync.RWMutex
 	serviceListLock sync.RWMutex
@@ -106,6 +119,7 @@ func NewServiceSentinel(serviceSentinelDispatchBus chan<- *model.Service) (*Serv
 		serviceResponseDataStore: make(map[uint64]serviceResponseData),
 		latestResults:            make(map[uint64]map[uint64]model.ServiceLatestResult),
 		recentResults:            make(map[uint64][]model.ServiceLatestResult),
+		historyCheckpoints:       make(map[serviceHistoryCheckpointKey]serviceHistoryCheckpoint),
 		services:                 make(map[uint64]*model.Service),
 		tlsCertCache:             make(map[uint64]string),
 		// 30澶╂暟鎹紦瀛?
@@ -557,6 +571,9 @@ func (ss *ServiceSentinel) worker() {
 			}); err != nil {
 				log.Printf("NEZHA>> Failed to save service monitor metrics to TSDB: %v", err)
 			}
+			ss.persistServiceHistoryCheckpoint(
+				mh.GetId(), r.Reporter, now, float64(mh.Delay), mh.Successful, mh.Data,
+			)
 		} else if err := DB.Create(&model.ServiceHistory{
 			ServiceID: mh.GetId(), ServerID: r.Reporter, CreatedAt: now,
 			AvgDelay: float64(mh.Delay), Data: mh.Data,
