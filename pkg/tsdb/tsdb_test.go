@@ -288,6 +288,73 @@ func TestTSDB_QueryServiceHistory6HoursPreservesEveryProbe(t *testing.T) {
 	assert.Equal(t, uint8(1), points[1].ErrorCode)
 }
 
+func TestTSDB_QueryServiceHistoryByServerIDSpansFullSixHours(t *testing.T) {
+	tempDir := t.TempDir()
+	db, err := Open(&Config{
+		DataPath: filepath.Join(tempDir, "tsdb"), RetentionDays: 1,
+		MinFreeDiskSpaceGB: 1, DedupInterval: time.Millisecond,
+	})
+	require.NoError(t, err)
+	defer db.Close()
+
+	now := time.Now().Truncate(time.Millisecond)
+	start := now.Add(-6*time.Hour + time.Minute)
+	probes := make([]*ServiceMetrics, 0, 5400)
+	for at := start; !at.After(now); at = at.Add(4 * time.Second) {
+		probes = append(probes, &ServiceMetrics{
+			ServiceID: 10, ServerID: 20, Timestamp: at,
+			Delay: 20, Successful: true,
+		})
+	}
+	require.NoError(t, db.WriteBatchServiceMetrics(probes))
+	db.Flush()
+
+	result, err := db.QueryServiceHistoryByServerID(20, Period6Hours)
+	require.NoError(t, err)
+	require.Contains(t, result, uint64(10))
+	require.Len(t, result[10].Servers, 1)
+	points := result[10].Servers[0].Stats.DataPoints
+	require.NotEmpty(t, points)
+	assert.LessOrEqual(t, len(points), maxServiceChartPoints)
+	assert.WithinDuration(t, start, time.UnixMilli(points[0].Timestamp), 10*time.Second)
+	assert.WithinDuration(t, now, time.UnixMilli(points[len(points)-1].Timestamp), 10*time.Second)
+	assert.Greater(t, points[len(points)-1].Timestamp-points[0].Timestamp, int64(5*time.Hour/time.Millisecond))
+}
+
+func TestTSDB_QueryServiceHistoryByServerIDSpansFullSixHoursAfterReopen(t *testing.T) {
+	tempDir := t.TempDir()
+	config := &Config{
+		DataPath: filepath.Join(tempDir, "tsdb"), RetentionDays: 1,
+		MinFreeDiskSpaceGB: 1, DedupInterval: time.Millisecond,
+	}
+	db, err := Open(config)
+	require.NoError(t, err)
+
+	now := time.Now().Truncate(time.Millisecond)
+	start := now.Add(-6*time.Hour + time.Minute)
+	probes := make([]*ServiceMetrics, 0, 5400)
+	for at := start; !at.After(now); at = at.Add(4 * time.Second) {
+		probes = append(probes, &ServiceMetrics{
+			ServiceID: 10, ServerID: 20, Timestamp: at,
+			Delay: 20, Successful: true,
+		})
+	}
+	require.NoError(t, db.WriteBatchServiceMetrics(probes))
+	db.Flush()
+	require.NoError(t, db.Close())
+
+	db, err = Open(config)
+	require.NoError(t, err)
+	defer db.Close()
+	result, err := db.QueryServiceHistoryByServerID(20, Period6Hours)
+	require.NoError(t, err)
+	require.Contains(t, result, uint64(10))
+	points := result[10].Servers[0].Stats.DataPoints
+	require.NotEmpty(t, points)
+	assert.WithinDuration(t, start, time.UnixMilli(points[0].Timestamp), 10*time.Second)
+	assert.WithinDuration(t, now, time.UnixMilli(points[len(points)-1].Timestamp), 10*time.Second)
+}
+
 func TestCompactServiceChartPointsPreservesRealOutageTransitions(t *testing.T) {
 	points := make([]DataPoint, 5000)
 	for i := range points {

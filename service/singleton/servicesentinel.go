@@ -83,8 +83,8 @@ type ServiceSentinel struct {
 	serviceResponseDataStore     map[uint64]serviceResponseData   // 褰撳墠鏁版嵁
 
 	latestResultLock sync.RWMutex
-	latestResults    map[uint64]map[uint64]model.ServiceLatestResult // [service_id][server_id]
-	recentResults    map[uint64][]model.ServiceLatestResult          // [server_id], bounded live event stream
+	latestResults    map[uint64]map[uint64]model.ServiceLatestResult   // [service_id][server_id]
+	recentResults    map[uint64]map[uint64][]model.ServiceLatestResult // [server_id][service_id], bounded live event streams
 	tlsCertCache     map[uint64]string
 
 	historyCheckpointLock sync.Mutex
@@ -118,7 +118,7 @@ func NewServiceSentinel(serviceSentinelDispatchBus chan<- *model.Service) (*Serv
 		serviceCurrentStatusData: make(map[uint64]*serviceTaskStatus),
 		serviceResponseDataStore: make(map[uint64]serviceResponseData),
 		latestResults:            make(map[uint64]map[uint64]model.ServiceLatestResult),
-		recentResults:            make(map[uint64][]model.ServiceLatestResult),
+		recentResults:            make(map[uint64]map[uint64][]model.ServiceLatestResult),
 		historyCheckpoints:       make(map[serviceHistoryCheckpointKey]serviceHistoryCheckpoint),
 		services:                 make(map[uint64]*model.Service),
 		tlsCertCache:             make(map[uint64]string),

@@ -53,24 +53,35 @@ func (ss *ServiceSentinel) setLatestResult(service *model.Service, server *model
 		ss.latestResults[service.ID] = make(map[uint64]model.ServiceLatestResult)
 	}
 	ss.latestResults[service.ID][server.ID] = latest
-	const maxRecentResultsPerServer = 4096
-	recent := append(ss.recentResults[server.ID], latest)
-	if len(recent) > maxRecentResultsPerServer {
-		recent = append([]model.ServiceLatestResult(nil), recent[len(recent)-maxRecentResultsPerServer:]...)
+	const maxRecentResultsPerService = 8192
+	if ss.recentResults[server.ID] == nil {
+		ss.recentResults[server.ID] = make(map[uint64][]model.ServiceLatestResult)
 	}
-	ss.recentResults[server.ID] = recent
+	recent := append(ss.recentResults[server.ID][service.ID], latest)
+	if len(recent) > maxRecentResultsPerService {
+		recent = append([]model.ServiceLatestResult(nil), recent[len(recent)-maxRecentResultsPerService:]...)
+	}
+	ss.recentResults[server.ID][service.ID] = recent
 }
 
 func (ss *ServiceSentinel) RecentResultsByServer(serverID uint64, since int64) []model.ServiceLatestResult {
 	ss.latestResultLock.RLock()
 	defer ss.latestResultLock.RUnlock()
-	recent := ss.recentResults[serverID]
-	result := make([]model.ServiceLatestResult, 0, len(recent))
-	for _, item := range recent {
-		if item.Timestamp > since {
-			result = append(result, item)
+	perService := ss.recentResults[serverID]
+	result := make([]model.ServiceLatestResult, 0)
+	for _, recent := range perService {
+		for _, item := range recent {
+			if item.Timestamp > since {
+				result = append(result, item)
+			}
 		}
 	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Timestamp != result[j].Timestamp {
+			return result[i].Timestamp < result[j].Timestamp
+		}
+		return result[i].ServiceID < result[j].ServiceID
+	})
 	return result
 }
 
