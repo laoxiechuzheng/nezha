@@ -425,10 +425,9 @@ func mergeServiceTransitions(sampled []DataPoint, raw []rawDataPoint) []DataPoin
 	return result
 }
 
-// compactServiceChartPoints selects real probe samples for the browser chart.
-// It never averages or invents latency values and always keeps outage/recovery
-// transitions, so the full-resolution TSDB data remains untouched while 6h
-// responses stay small enough to render promptly on phones.
+// compactServiceChartPoints selects median-shaped real probe samples for the
+// browser chart. It never averages or invents latency values and always keeps
+// outage/recovery transitions, so occasional peaks do not dominate every bucket.
 func compactServiceChartPoints(points []DataPoint, maxPoints int) []DataPoint {
 	if maxPoints < 2 || len(points) <= maxPoints {
 		return points
@@ -444,23 +443,49 @@ func compactServiceChartPoints(points []DataPoint, maxPoints int) []DataPoint {
 
 	remaining := maxPoints - len(mandatory)
 	if remaining > 0 {
-		bucketSize := float64(len(points)) / float64(remaining)
-		for bucket := 0; bucket < remaining; bucket++ {
-			from := int(float64(bucket) * bucketSize)
-			to := int(float64(bucket+1) * bucketSize)
-			if to <= from {
-				to = from + 1
-			}
-			if to > len(points) {
-				to = len(points)
-			}
-			representative := from
-			for i := from + 1; i < to; i++ {
-				if points[i].Delay > points[representative].Delay {
-					representative = i
+		anomalyBuckets := min(48, remaining/12)
+		if anomalyBuckets > 0 {
+			bucketSize := float64(len(points)) / float64(anomalyBuckets)
+			for bucket := 0; bucket < anomalyBuckets; bucket++ {
+				from := int(float64(bucket) * bucketSize)
+				to := min(len(points), int(float64(bucket+1)*bucketSize))
+				if to <= from {
+					to = min(len(points), from+1)
 				}
+				representative := from
+				for i := from + 1; i < to; i++ {
+					if points[i].Status != 0 && points[i].Delay > points[representative].Delay {
+						representative = i
+					}
+				}
+				mandatory[representative] = struct{}{}
 			}
-			mandatory[representative] = struct{}{}
+		}
+
+		trendBuckets := maxPoints - len(mandatory)
+		if trendBuckets > 0 {
+			bucketSize := float64(len(points)) / float64(trendBuckets)
+			for bucket := 0; bucket < trendBuckets; bucket++ {
+				from := int(float64(bucket) * bucketSize)
+				to := min(len(points), int(float64(bucket+1)*bucketSize))
+				if to <= from {
+					to = min(len(points), from+1)
+				}
+				healthyIndices := make([]int, 0, to-from)
+				for i := from; i < to; i++ {
+					if points[i].Status != 0 {
+						healthyIndices = append(healthyIndices, i)
+					}
+				}
+				sort.Slice(healthyIndices, func(i, j int) bool {
+					return points[healthyIndices[i]].Delay < points[healthyIndices[j]].Delay
+				})
+				representative := (from + to - 1) / 2
+				if len(healthyIndices) > 0 {
+					representative = healthyIndices[(len(healthyIndices)-1)/2]
+				}
+				mandatory[representative] = struct{}{}
+			}
 		}
 	}
 

@@ -9,7 +9,7 @@
   name: "Official"
   repository: "https://github.com/laoxiechuzheng/nezha-dash-v2"
   author: "laoxiechuzheng"
-  version: "v2.4.2-realtime.10"
+  version: "v2.4.2-realtime.11"
   is_official: true
 - path: "nazhua-dist"
   name: "Nazhua"

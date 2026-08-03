@@ -385,6 +385,40 @@ func TestCompactServiceChartPointsPreservesRealOutageTransitions(t *testing.T) {
 	}
 }
 
+func TestCompactServiceChartPointsDoesNotBiasEveryBucketToPeak(t *testing.T) {
+	points := make([]DataPoint, 4320)
+	for i := range points {
+		delay := float64(50 + i%51)
+		if i%24 == 0 {
+			delay = 2200
+		}
+		points[i] = DataPoint{
+			Timestamp: int64(i * 5000),
+			Delay:     delay,
+			Status:    1,
+		}
+	}
+
+	compacted := compactServiceChartPoints(points, 360)
+	realSamples := make(map[int64]struct{}, len(points))
+	for _, point := range points {
+		realSamples[point.Timestamp] = struct{}{}
+	}
+	peakCount := 0
+	for i, point := range compacted {
+		_, ok := realSamples[point.Timestamp]
+		require.True(t, ok, "sample %d must come from the input", i)
+		if i > 0 {
+			assert.Greater(t, point.Timestamp, compacted[i-1].Timestamp)
+		}
+		if point.Delay == 2200 {
+			peakCount++
+		}
+	}
+	assert.Positive(t, peakCount)
+	assert.Less(t, peakCount, len(compacted)/10)
+}
+
 func TestServiceChartDownsamplingUsesRealSamples(t *testing.T) {
 	healthy := []rawDataPoint{
 		{timestamp: 1000, value: 10, status: 1, hasDelay: true, hasStatus: true},
