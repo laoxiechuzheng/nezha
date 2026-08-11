@@ -9,7 +9,8 @@ func NewEmptyServerClassForTest() *ServerClass {
 		class: class[uint64, *model.Server]{
 			list: make(map[uint64]*model.Server),
 		},
-		uuidToID: make(map[string]uint64),
+		uuidToID:       make(map[string]uint64),
+		ddnsDispatcher: newDDNSDispatcher(defaultDDNSConcurrency, nil, nil),
 	}
 	model.OwnerServerIDsLookup = sc.ownerServerIDs
 	model.AllServerIDsLookup = sc.allServerIDs

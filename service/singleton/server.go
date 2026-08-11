@@ -2,18 +2,20 @@ package singleton
 
 import (
 	"cmp"
-	"context"
+	"fmt"
 	"log"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/nezhahq/nezha/model"
-	"github.com/nezhahq/nezha/pkg/ddns"
 	"github.com/nezhahq/nezha/pkg/utils"
 )
 
 type ServerClass struct {
 	class[uint64, *model.Server]
+	geoIPReportLocks sync.Map
+	ddnsDispatcher   *ddnsDispatcher
 
 	uuidToID map[string]uint64
 
@@ -25,7 +27,8 @@ func NewServerClass() *ServerClass {
 		class: class[uint64, *model.Server]{
 			list: make(map[uint64]*model.Server),
 		},
-		uuidToID: make(map[string]uint64),
+		uuidToID:       make(map[string]uint64),
+		ddnsDispatcher: newDDNSDispatcher(defaultDDNSConcurrency, nil, nil),
 	}
 
 	var servers []model.Server
@@ -43,6 +46,35 @@ func NewServerClass() *ServerClass {
 	model.OwnerIsAdminLookup = ownerIsAdmin
 
 	return sc
+}
+
+func (c *ServerClass) geoIPReportLock(serverID uint64) *sync.Mutex {
+	lock, _ := c.geoIPReportLocks.LoadOrStore(serverID, &sync.Mutex{})
+	return lock.(*sync.Mutex)
+}
+
+func (c *ServerClass) AcceptGeoIPReport(serverID uint64, geoIP model.GeoIP) (*model.Server, model.GeoIP, bool, error) {
+	lock := c.geoIPReportLock(serverID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	server, ok := c.Get(serverID)
+	if !ok || server == nil {
+		return nil, model.GeoIP{}, false, fmt.Errorf("server not found")
+	}
+
+	var previous model.GeoIP
+	if server.GeoIP != nil {
+		previous = *server.GeoIP
+	}
+	changed := previous.IP.IPv4Addr != geoIP.IP.IPv4Addr
+	server.GeoIP = &geoIP
+	if changed && server.EnableDDNS && geoIP.IP.IPv4Addr != "" {
+		if err := c.UpdateDDNS(server, &geoIP.IP); err != nil {
+			log.Printf("NEZHA>> Failed to queue DDNS update for server %d: %v", server.ID, err)
+		}
+	}
+	return server, previous, changed, nil
 }
 
 func (c *ServerClass) ownerServerIDs(ownerUID uint64) []uint64 {
@@ -72,6 +104,9 @@ func ownerIsAdmin(ownerUID uint64) bool {
 }
 
 func (c *ServerClass) Update(s *model.Server, uuid string) {
+	if c.ddnsDispatcher != nil {
+		c.ddnsDispatcher.cancelServer(s.ID)
+	}
 	c.listMu.Lock()
 
 	c.list[s.ID] = s
@@ -83,7 +118,7 @@ func (c *ServerClass) Update(s *model.Server, uuid string) {
 
 	if s.EnableDDNS {
 		if err := c.UpdateDDNS(s, nil); err != nil {
-			log.Printf("NEZHA>> Failed to update DDNS for server %d: %v", err, s.ID)
+			log.Printf("NEZHA>> Failed to update DDNS for server %d: %v", s.ID, err)
 		}
 	}
 
@@ -91,6 +126,12 @@ func (c *ServerClass) Update(s *model.Server, uuid string) {
 }
 
 func (c *ServerClass) Delete(idList []uint64) {
+	for _, id := range idList {
+		if c.ddnsDispatcher != nil {
+			c.ddnsDispatcher.cancelServer(id)
+		}
+		c.geoIPReportLocks.Delete(id)
+	}
 	c.listMu.Lock()
 
 	for _, id := range idList {
@@ -123,22 +164,60 @@ func (c *ServerClass) UUIDToID(uuid string) (id uint64, ok bool) {
 }
 
 func (c *ServerClass) UpdateDDNS(server *model.Server, ip *model.IP) error {
-	confServers := strings.Split(Conf.DNSServers, ",")
-	ctx := context.WithValue(context.Background(), ddns.DNSServerKey{}, utils.IfOr(confServers[0] != "", confServers, utils.DNSServers))
+	if c.ddnsDispatcher == nil {
+		return fmt.Errorf("DDNS dispatcher is not initialized")
+	}
+	dnsServers := configuredDNSServers(Conf.DNSServers)
+	selectedIP := ip
+	if selectedIP == nil {
+		if server.GeoIP == nil {
+			return fmt.Errorf("server %d has no reported IP", server.ID)
+		}
+		selectedIP = &server.GeoIP.IP
+	}
+	if selectedIP.IPv4Addr == "" {
+		return nil
+	}
 
-	providers, err := DDNSShared.GetDDNSProvidersFromProfiles(server.DDNSProfiles, utils.IfOr(ip != nil, ip, &server.GeoIP.IP), server.GetUserID())
+	providers, err := DDNSShared.GetDDNSProvidersFromProfiles(server.DDNSProfiles, selectedIP, server.GetUserID())
 	if err != nil {
 		return err
 	}
 
 	for _, provider := range providers {
 		domains := server.OverrideDDNSDomains[provider.GetProfileID()]
-		go func(provider *ddns.Provider) {
-			provider.UpdateDomain(ctx, domains...)
-		}(provider)
+		if len(domains) == 0 {
+			domains = provider.DDNSProfile.Domains
+		}
+		for _, domain := range domains {
+			taskProvider, err := DDNSShared.providerFromProfile(provider.DDNSProfile, &model.IP{
+				IPv4Addr: provider.IPAddrs.IPv4Addr,
+				IPv6Addr: provider.IPAddrs.IPv6Addr,
+			})
+			if err != nil {
+				return err
+			}
+			c.ddnsDispatcher.enqueue(ddnsDispatchTask{
+				serverID: server.ID, profileID: provider.GetProfileID(), domain: domain,
+				provider: taskProvider, dnsServers: slices.Clone(dnsServers),
+			})
+		}
 	}
 
 	return nil
+}
+
+func configuredDNSServers(raw string) []string {
+	servers := make([]string, 0)
+	for _, server := range strings.Split(raw, ",") {
+		if server = strings.TrimSpace(server); server != "" {
+			servers = append(servers, server)
+		}
+	}
+	if len(servers) == 0 {
+		return slices.Clone(utils.DNSServers)
+	}
+	return servers
 }
 
 func (c *ServerClass) sortList() {

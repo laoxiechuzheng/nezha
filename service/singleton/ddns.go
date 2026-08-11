@@ -40,14 +40,30 @@ func NewDDNSClass() *DDNSClass {
 }
 
 func (c *DDNSClass) Update(p *model.DDNSProfile) {
+	if ServerShared != nil && ServerShared.ddnsDispatcher != nil {
+		ServerShared.ddnsDispatcher.cancelProfiles([]uint64{p.ID})
+	}
 	c.listMu.Lock()
 	c.list[p.ID] = p
 	c.listMu.Unlock()
 
 	c.sortList()
+	if ServerShared != nil {
+		ServerShared.Range(func(_ uint64, server *model.Server) bool {
+			if server != nil && server.EnableDDNS && slices.Contains(server.DDNSProfiles, p.ID) {
+				if err := ServerShared.UpdateDDNS(server, nil); err != nil {
+					log.Printf("NEZHA>> Failed to requeue DDNS after profile %d update for server %d: %v", p.ID, server.ID, err)
+				}
+			}
+			return true
+		})
+	}
 }
 
 func (c *DDNSClass) Delete(idList []uint64) {
+	if ServerShared != nil && ServerShared.ddnsDispatcher != nil {
+		ServerShared.ddnsDispatcher.cancelProfiles(idList)
+	}
 	c.listMu.Lock()
 	for _, id := range idList {
 		delete(c.list, id)
@@ -91,28 +107,35 @@ func (c *DDNSClass) GetDDNSProvidersFromProfiles(profileId []uint64, ip *model.I
 
 	providers := make([]*ddns2.Provider, 0, len(profiles))
 	for _, profile := range profiles {
-		provider := &ddns2.Provider{DDNSProfile: profile, IPAddrs: ip}
-		switch profile.Provider {
-		case model.ProviderDummy:
-			provider.Setter = &dummy.Provider{}
-			providers = append(providers, provider)
-		case model.ProviderWebHook:
-			provider.Setter = &webhook.Provider{DDNSProfile: profile}
-			providers = append(providers, provider)
-		case model.ProviderCloudflare:
-			provider.Setter = &cloudflare.Provider{APIToken: profile.AccessSecret}
-			providers = append(providers, provider)
-		case model.ProviderTencentCloud:
-			provider.Setter = &tencentcloud.Provider{SecretId: profile.AccessID, SecretKey: profile.AccessSecret}
-			providers = append(providers, provider)
-		case model.ProviderHE:
-			provider.Setter = &he.Provider{APIKey: profile.AccessSecret}
-			providers = append(providers, provider)
-		default:
-			return nil, fmt.Errorf("cannot find DDNS provider %s", profile.Provider)
+		provider, err := c.providerFromProfile(profile, ip)
+		if err != nil {
+			return nil, err
 		}
+		providers = append(providers, provider)
 	}
 	return providers, nil
+}
+
+func (c *DDNSClass) providerFromProfile(profile *model.DDNSProfile, ip *model.IP) (*ddns2.Provider, error) {
+	profileSnapshot := *profile
+	profileSnapshot.Domains = slices.Clone(profile.Domains)
+	ipSnapshot := *ip
+	provider := &ddns2.Provider{DDNSProfile: &profileSnapshot, IPAddrs: &ipSnapshot}
+	switch profileSnapshot.Provider {
+	case model.ProviderDummy:
+		provider.Setter = &dummy.Provider{}
+	case model.ProviderWebHook:
+		provider.Setter = &webhook.Provider{DDNSProfile: &profileSnapshot}
+	case model.ProviderCloudflare:
+		provider.Setter = &cloudflare.Provider{APIToken: profileSnapshot.AccessSecret}
+	case model.ProviderTencentCloud:
+		provider.Setter = &tencentcloud.Provider{SecretId: profileSnapshot.AccessID, SecretKey: profileSnapshot.AccessSecret}
+	case model.ProviderHE:
+		provider.Setter = &he.Provider{APIKey: profileSnapshot.AccessSecret}
+	default:
+		return nil, fmt.Errorf("cannot find DDNS provider %s", profileSnapshot.Provider)
+	}
+	return provider, nil
 }
 
 func (c *DDNSClass) sortList() {

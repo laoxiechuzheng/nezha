@@ -357,41 +357,7 @@ func (s *NezhaHandler) ReportGeoIP(c context.Context, r *pb.GeoIP) (*pb.GeoIP, e
 		geoip.IP.IPv4Addr = ip
 	}
 
-	joinedIP := geoip.IP.Join()
-
-	server, ok := singleton.ServerShared.Get(clientID)
-	if !ok || server == nil {
-		return nil, fmt.Errorf("server not found")
-	}
-
-	// 检查并更新DDNS
-	if server.EnableDDNS && joinedIP != "" &&
-		(server.GeoIP == nil || server.GeoIP.IP != geoip.IP) {
-		ipv4 := geoip.IP.IPv4Addr
-		ipv6 := geoip.IP.IPv6Addr
-
-		if err := singleton.ServerShared.UpdateDDNS(server, &model.IP{IPv4Addr: ipv4, IPv6Addr: ipv6}); err != nil {
-			log.Printf("NEZHA>> Failed to update DDNS for server %d: %v", err, server.ID)
-		}
-	}
-
-	// 发送IP变动通知
-	if server.GeoIP != nil && singleton.Conf.EnableIPChangeNotification &&
-		((singleton.Conf.Cover == model.ConfigCoverAll && !singleton.Conf.IgnoredIPNotificationServerIDs[clientID]) ||
-			(singleton.Conf.Cover == model.ConfigCoverIgnoreAll && singleton.Conf.IgnoredIPNotificationServerIDs[clientID])) &&
-		server.GeoIP.IP.Join() != "" &&
-		joinedIP != "" &&
-		server.GeoIP.IP != geoip.IP {
-
-		singleton.NotificationShared.SendNotification(singleton.Conf.IPChangeNotificationGroupID,
-			fmt.Sprintf(
-				"[%s] %s, %s => %s",
-				singleton.Localizer.T("IP Changed"),
-				server.Name, singleton.IPDesensitize(server.GeoIP.IP.Join()),
-				singleton.IPDesensitize(joinedIP),
-			),
-			"")
-	}
+	joinedIP := geoip.IP.IPv4Addr
 
 	// 根据内置数据库查询 IP 地理位置
 	var ip string
@@ -408,8 +374,24 @@ func (s *NezhaHandler) ReportGeoIP(c context.Context, r *pb.GeoIP) (*pb.GeoIP, e
 	}
 	geoip.CountryCode = location
 
-	// 将地区码写入到 Host
-	server.GeoIP = &geoip
+	server, previousGeoIP, changed, err := singleton.ServerShared.AcceptGeoIPReport(clientID, geoip)
+	if err != nil {
+		return nil, err
+	}
+	previousIP := previousGeoIP.IP.IPv4Addr
+	if changed && singleton.Conf.EnableIPChangeNotification &&
+		((singleton.Conf.Cover == model.ConfigCoverAll && !singleton.Conf.IgnoredIPNotificationServerIDs[clientID]) ||
+			(singleton.Conf.Cover == model.ConfigCoverIgnoreAll && singleton.Conf.IgnoredIPNotificationServerIDs[clientID])) &&
+		previousIP != "" && joinedIP != "" {
+		singleton.NotificationShared.SendNotification(singleton.Conf.IPChangeNotificationGroupID,
+			fmt.Sprintf(
+				"[%s] %s, %s => %s",
+				singleton.Localizer.T("IP Changed"),
+				server.Name, singleton.IPDesensitize(previousIP),
+				singleton.IPDesensitize(joinedIP),
+			),
+			"")
+	}
 
 	return &pb.GeoIP{Ip: nil, CountryCode: location, DashboardBootTime: singleton.DashboardBootTime}, nil
 }

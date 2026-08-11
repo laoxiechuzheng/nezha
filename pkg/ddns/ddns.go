@@ -2,6 +2,7 @@ package ddns
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/netip"
@@ -33,18 +34,27 @@ func (provider *Provider) GetProfileID() uint64 {
 	return provider.DDNSProfile.ID
 }
 
-func (provider *Provider) UpdateDomain(ctx context.Context, overrideDomains ...string) {
+func (provider *Provider) UpdateDomain(ctx context.Context, overrideDomains ...string) error {
+	var updateErrors []error
 	for _, domain := range utils.IfOr(len(overrideDomains) > 0, overrideDomains, provider.DDNSProfile.Domains) {
-		for retries := range int(provider.DDNSProfile.MaxRetries) {
-			log.Printf("NEZHA>> Updating DNS Record of domain %s: %d/%d", domain, retries+1, provider.DDNSProfile.MaxRetries)
+		maxRetries := max(1, int(provider.DDNSProfile.MaxRetries))
+		var lastError error
+		for retries := range maxRetries {
+			log.Printf("NEZHA>> Updating DNS Record of domain %s: %d/%d", domain, retries+1, maxRetries)
 			if err := provider.updateDomain(ctx, domain); err != nil {
+				lastError = err
 				log.Printf("NEZHA>> Failed to update DNS record of domain %s: %v", domain, err)
 			} else {
+				lastError = nil
 				log.Printf("NEZHA>> Update DNS record of domain %s succeeded", domain)
 				break
 			}
 		}
+		if lastError != nil {
+			updateErrors = append(updateErrors, fmt.Errorf("update %s: %w", domain, lastError))
+		}
 	}
+	return errors.Join(updateErrors...)
 }
 
 func (provider *Provider) updateDomain(ctx context.Context, domain string) error {
@@ -105,7 +115,7 @@ func (provider *Provider) splitDomainSOA(ctx context.Context, domain string) (pr
 			var m dns.Msg
 			m.SetQuestion(domain[idx:], dns.TypeSOA)
 
-			r, _, err := c.Exchange(&m, server)
+			r, _, err := c.ExchangeContext(ctx, &m, server)
 			if err != nil {
 				continue
 			}
