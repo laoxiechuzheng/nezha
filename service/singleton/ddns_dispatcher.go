@@ -2,9 +2,10 @@ package singleton
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"fmt"
 	"log"
-	"math/rand/v2"
+	"math/big"
 	"strings"
 	"sync"
 	"time"
@@ -78,7 +79,12 @@ func defaultDDNSRetryDelay(attempt int) time.Duration {
 		delay *= 2
 	}
 	delay = min(delay, 5*time.Minute)
-	jitter := time.Duration(rand.Int64N(max(int64(delay/5), 1)))
+	jitterLimit := big.NewInt(max(int64(delay/5), 1))
+	jitterValue, err := cryptorand.Int(cryptorand.Reader, jitterLimit)
+	if err != nil {
+		return delay
+	}
+	jitter := time.Duration(jitterValue.Int64())
 	return delay + jitter
 }
 
