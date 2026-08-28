@@ -128,6 +128,16 @@ func OnDeleteAlert(id []uint64) {
 	}
 }
 
+// ipChangeIncident 判断最近一次采样是否构成"纯 IP 变更"事件，并返回变更详情。
+// 仅当失败完全由 ip_change 规则造成时返回 ok=true；此时采用事件语义：
+// 触发故障任务与通知后立即复位，不进入"恢复"通知/恢复任务流程。
+func ipChangeIncident(alert *model.AlertRule, latest []bool, serverID uint64) (model.IPChange, bool) {
+	if len(latest) == 0 || !alert.FailedOnlyOnIPChange(latest) {
+		return model.IPChange{}, false
+	}
+	return alert.IPChangeFor(serverID)
+}
+
 // checkStatus 检查报警规则并发送报警
 func checkStatus() {
 	AlertsLock.RLock()
@@ -155,7 +165,8 @@ func checkStatus() {
 			alertsStore[alert.ID][server.ID] = append(alertsStore[alert.
 				ID][server.ID], alert.Snapshot(AlertsCycleTransferStatsStore[alert.ID], server, DB))
 			// 发送通知，分为触发报警和恢复通知
-			_, passed := alert.Check(alertsStore[alert.ID][server.ID])
+			points := alertsStore[alert.ID][server.ID]
+			_, passed := alert.Check(points)
 			// 保存当前服务器状态信息
 			curServer := model.Server{}
 			copier.Copy(&curServer, server)
@@ -164,13 +175,23 @@ func checkStatus() {
 			if !passed {
 				// 始终触发模式或上次检查不为失败时触发报警（跳过单次触发+上次失败的情况）
 				if alert.TriggerMode == model.ModeAlwaysTrigger || alertsPrevState[alert.ID][server.ID] != _RuleCheckFail {
-					alertsPrevState[alert.ID][server.ID] = _RuleCheckFail
-					message := fmt.Sprintf("[%s] %s(%s) %s", Localizer.T("Incident"),
-						server.Name, IPDesensitize(server.GeoIP.IP.Join()), alert.Name)
-					go CronShared.SendTriggerTasks(alert.FailTriggerTasks, curServer.ID, alert.UserID)
-					go NotificationShared.SendNotification(alert.NotificationGroupID, message, NotificationMuteLabel.ServerIncident(server.ID, alert.ID), &curServer)
-					// 清除恢复通知的静音缓存
-					NotificationShared.UnMuteNotification(alert.NotificationGroupID, NotificationMuteLabel.ServerIncidentResolved(server.ID, alert.ID))
+					// 纯 IP 变更事件：触发故障任务与通知后立即复位为"通过"，不产生 3 秒后的"恢复"通知/恢复任务。
+					if change, ok := ipChangeIncident(alert, points[len(points)-1], server.ID); ok {
+						alertsPrevState[alert.ID][server.ID] = _RuleCheckPass
+						go CronShared.SendTriggerTasks(alert.FailTriggerTasks, curServer.ID, alert.UserID)
+						go NotificationShared.SendNotification(alert.NotificationGroupID,
+							fmt.Sprintf("[%s] %s, %s => %s", Localizer.T("IP Changed"), server.Name,
+								IPDesensitize(change.Previous), IPDesensitize(change.Current)),
+							"", &curServer)
+					} else {
+						alertsPrevState[alert.ID][server.ID] = _RuleCheckFail
+						message := fmt.Sprintf("[%s] %s(%s) %s", Localizer.T("Incident"),
+							server.Name, IPDesensitize(server.GeoIP.IP.Join()), alert.Name)
+						go CronShared.SendTriggerTasks(alert.FailTriggerTasks, curServer.ID, alert.UserID)
+						go NotificationShared.SendNotification(alert.NotificationGroupID, message, NotificationMuteLabel.ServerIncident(server.ID, alert.ID), &curServer)
+						// 清除恢复通知的静音缓存
+						NotificationShared.UnMuteNotification(alert.NotificationGroupID, NotificationMuteLabel.ServerIncidentResolved(server.ID, alert.ID))
+					}
 				}
 			} else {
 				// 本次通过检查但上一次的状态为失败，则发送恢复通知

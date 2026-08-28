@@ -164,6 +164,18 @@ func (r *AlertRule) Check(points [][]bool) (int, bool) {
 			}
 			durations[ruleIndex] = fail
 			continue
+		} else if rule.IsIPChangeRule() {
+			// IP 变更属于瞬时事件：只回看最后一个采样点，Duration 不参与判定。
+			if durations[ruleIndex] < 1 {
+				durations[ruleIndex] = 1
+			}
+			if hasPassedRule {
+				continue
+			}
+			if len(points) > 0 && points[len(points)-1][ruleIndex] {
+				hasPassedRule = true
+			}
+			continue
 		} else {
 			// 常规报警
 			// duration<=0 是无意义的规则（持续 0 秒）：直接跳过该规则，
@@ -206,7 +218,7 @@ func (r *AlertRule) RetentionWindow() int {
 	window := 0
 	for _, rule := range r.Rules {
 		var need int
-		if rule.IsTransferDurationRule() {
+		if rule.IsTransferDurationRule() || rule.IsIPChangeRule() {
 			need = 1
 		} else if d := int(rule.Duration); d > 0 {
 			need = d
@@ -216,6 +228,38 @@ func (r *AlertRule) RetentionWindow() int {
 		}
 	}
 	return window
+}
+
+// IPChangeFor 返回该告警规则中第一条 ip_change 规则为指定服务器记录的最近一次
+// IP 变更详情，供 checkStatus 把通知文案替换为 "[IP Changed] name, old => new"。
+func (r *AlertRule) IPChangeFor(serverID uint64) (IPChange, bool) {
+	for _, rule := range r.Rules {
+		if rule != nil && rule.IsIPChangeRule() {
+			if change, ok := rule.LastIPChange[serverID]; ok {
+				return change, true
+			}
+		}
+	}
+	return IPChange{}, false
+}
+
+// FailedOnlyOnIPChange 判断最近一个采样点是否只由 ip_change 规则未通过导致。
+// 纯 IP 变更采用事件语义（不进入恢复流程）；混合其它规则失败时保持原有语义。
+func (r *AlertRule) FailedOnlyOnIPChange(latest []bool) bool {
+	failed := false
+	for i, rule := range r.Rules {
+		if i >= len(latest) {
+			break
+		}
+		if latest[i] {
+			continue
+		}
+		failed = true
+		if rule == nil || !rule.IsIPChangeRule() {
+			return false
+		}
+	}
+	return failed
 }
 
 func boundCheck(length, duration int, passed bool) bool {

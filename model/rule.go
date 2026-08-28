@@ -36,6 +36,16 @@ type Rule struct {
 	// 只作为缓存使用，记录下次该检测的时间
 	NextTransferAt  map[uint64]time.Time `json:"-"`
 	LastCycleStatus map[uint64]bool      `json:"-"`
+	// ip_change 专用缓存：每台服务器上次上报的 IP 与最近一次变更详情。
+	// 仅内存态（json:"-"），不落库；面板重启后重新建立基线，避免误报。
+	LastIP       map[uint64]string   `json:"-"`
+	LastIPChange map[uint64]IPChange `json:"-"`
+}
+
+// IPChange 记录一次服务器 IP 变更，用于告警通知文案。
+type IPChange struct {
+	Previous string
+	Current  string
 }
 
 func percentage(used, total uint64) float64 {
@@ -54,6 +64,11 @@ func (u *Rule) Snapshot(cycleTransferStats *CycleTransferStats, server *Server, 
 	// 忽略全部但是指定监控了此服务器
 	if u.Cover == RuleCoverIgnoreAll && !u.Ignore[server.ID] {
 		return true
+	}
+
+	// IP 变更属于瞬时事件：只与规则内缓存的基线比较，不依赖阈值/Duration。
+	if u.IsIPChangeRule() {
+		return u.SnapshotIPChange(server)
 	}
 
 	// 循环区间流量检测 · 短期无需重复检测
@@ -169,6 +184,44 @@ func (u *Rule) Snapshot(cycleTransferStats *CycleTransferStats, server *Server, 
 	}
 
 	return true
+}
+
+// IsIPChangeRule 判断该规则是否属于 IP 变更规则 属于则返回true
+func (u *Rule) IsIPChangeRule() bool {
+	return u.Type == "ip_change"
+}
+
+// SnapshotIPChange 评估 ip_change 规则：首次观测或任一侧 IP 为空时只建立/更新
+// 基线，不视为变更；仅当新旧 IP 均非空且不同时判定为一次变更（返回 false）。
+func (u *Rule) SnapshotIPChange(server *Server) bool {
+	if u.LastIP == nil {
+		u.LastIP = make(map[uint64]string)
+	}
+	if u.LastIPChange == nil {
+		u.LastIPChange = make(map[uint64]IPChange)
+	}
+	delete(u.LastIPChange, server.ID)
+
+	current := serverIPForChange(server)
+	previous, ok := u.LastIP[server.ID]
+	u.LastIP[server.ID] = current
+	if !ok || previous == "" || current == "" || previous == current {
+		return true
+	}
+	u.LastIPChange[server.ID] = IPChange{Previous: previous, Current: current}
+	return false
+}
+
+// serverIPForChange 返回用于变更检测的 IP：IPv4 优先，IPv4 为空时回退 IPv6，
+// 与现有配置级 IP 变更通知（ReportGeoIP）的比对口径保持一致。
+func serverIPForChange(server *Server) string {
+	if server == nil || server.GeoIP == nil {
+		return ""
+	}
+	if server.GeoIP.IP.IPv4Addr != "" {
+		return server.GeoIP.IP.IPv4Addr
+	}
+	return server.GeoIP.IP.IPv6Addr
 }
 
 // IsTransferDurationRule 判断该规则是否属于周期流量规则 属于则返回true

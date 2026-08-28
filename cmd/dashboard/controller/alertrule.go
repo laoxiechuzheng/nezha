@@ -178,11 +178,11 @@ func validateRule(c *gin.Context, r *model.AlertRule) error {
 				return singleton.Localizer.ErrorT("permission denied")
 			}
 
-			if !rule.IsTransferDurationRule() {
+			if !rule.IsTransferDurationRule() && !rule.IsIPChangeRule() {
 				if rule.Duration < 3 {
 					return singleton.Localizer.ErrorT("duration need to be at least 3")
 				}
-			} else {
+			} else if rule.IsTransferDurationRule() {
 				if rule.CycleInterval < 1 {
 					return singleton.Localizer.ErrorT("cycle_interval need to be at least 1")
 				}
