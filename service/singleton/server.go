@@ -14,6 +14,11 @@ import (
 
 type ServerClass struct {
 	class[uint64, *model.Server]
+
+	// lifecycleMu serializes changes to the authoritative server entries with
+	// synchronous ServiceSentinel report processing.
+	lifecycleMu sync.RWMutex
+
 	geoIPReportLocks sync.Map
 	ddnsDispatcher   *ddnsDispatcher
 
@@ -33,10 +38,10 @@ func NewServerClass() *ServerClass {
 
 	var servers []model.Server
 	DB.Find(&servers)
-	for _, s := range servers {
-		innerS := s
-		model.InitServer(&innerS)
-		sc.list[innerS.ID] = &innerS
+	for i := range servers {
+		innerS := &servers[i]
+		model.InitServer(innerS)
+		sc.list[innerS.ID] = innerS
 		sc.uuidToID[innerS.UUID] = innerS.ID
 	}
 	sc.sortList()
@@ -48,12 +53,31 @@ func NewServerClass() *ServerClass {
 	return sc
 }
 
+func (c *ServerClass) lockLifecycleRead() {
+	c.lifecycleMu.RLock()
+}
+
+func (c *ServerClass) unlockLifecycleRead() {
+	c.lifecycleMu.RUnlock()
+}
+
+func (c *ServerClass) lockLifecycleWrite() {
+	c.lifecycleMu.Lock()
+}
+
+func (c *ServerClass) unlockLifecycleWrite() {
+	c.lifecycleMu.Unlock()
+}
+
 func (c *ServerClass) geoIPReportLock(serverID uint64) *sync.Mutex {
 	lock, _ := c.geoIPReportLocks.LoadOrStore(serverID, &sync.Mutex{})
 	return lock.(*sync.Mutex)
 }
 
 func (c *ServerClass) AcceptGeoIPReport(serverID uint64, geoIP model.GeoIP) (*model.Server, model.GeoIP, bool, error) {
+	c.lockLifecycleRead()
+	defer c.unlockLifecycleRead()
+
 	lock := c.geoIPReportLock(serverID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -104,6 +128,9 @@ func ownerIsAdmin(ownerUID uint64) bool {
 }
 
 func (c *ServerClass) Update(s *model.Server, uuid string) {
+	c.lockLifecycleWrite()
+	defer c.unlockLifecycleWrite()
+
 	if c.ddnsDispatcher != nil {
 		c.ddnsDispatcher.cancelServer(s.ID)
 	}
@@ -126,6 +153,9 @@ func (c *ServerClass) Update(s *model.Server, uuid string) {
 }
 
 func (c *ServerClass) Delete(idList []uint64) {
+	c.lockLifecycleWrite()
+	defer c.unlockLifecycleWrite()
+
 	for _, id := range idList {
 		if c.ddnsDispatcher != nil {
 			c.ddnsDispatcher.cancelServer(id)
@@ -146,6 +176,17 @@ func (c *ServerClass) Delete(idList []uint64) {
 	c.listMu.Unlock()
 
 	c.sortList()
+}
+
+// setUserID updates in-memory ownership under the server lifecycle lock so a
+// transfer cannot change authorization during synchronous report processing.
+func (c *ServerClass) setUserID(id, userID uint64) {
+	c.lockLifecycleWrite()
+	defer c.unlockLifecycleWrite()
+
+	if s, ok := c.Get(id); ok && s != nil {
+		s.SetUserID(userID)
+	}
 }
 
 func (c *ServerClass) GetSortedListForGuest() []*model.Server {

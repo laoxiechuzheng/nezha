@@ -79,9 +79,9 @@ const defaultRevertDeliveryRecoveryWindow = defaultServerTransferTimeout
 // subscribers. All mutating operations go through methods so DB and in-memory
 // state stay in sync.
 type ServerTransferClass struct {
-	mu                     sync.RWMutex
-	pending                map[uint64]*model.ServerTransfer
-	revertDeliveries       map[uint64]*model.ServerTransfer
+	mu               sync.RWMutex
+	pending          map[uint64]*model.ServerTransfer
+	revertDeliveries map[uint64]*model.ServerTransfer
 	// revertRecovery holds RevertHandshakeSecrets the dashboard has pushed
 	// but the agent has not yet acknowledged, in the window between Cancel/
 	// Fail/Timeout and either the agent's reconnect (which MarkRevertDelivered
@@ -179,10 +179,14 @@ var ErrAgentTooOldForTransfer = fmt.Errorf("agent build older than %s does not s
 // never reported) so callers can defer the decision; PushIfOnline re-checks
 // at push time.
 func agentSupportsTransfer(s *model.Server) bool {
-	if s == nil || s.Host == nil {
+	if s == nil {
 		return true
 	}
-	v := strings.TrimSpace(s.Host.Version)
+	runtime := s.RuntimeSnapshot()
+	if runtime.Host == nil {
+		return true
+	}
+	v := strings.TrimSpace(runtime.Host.Version)
 	if v == "" {
 		return true
 	}
@@ -659,11 +663,9 @@ func (c *ServerTransferClass) Initiate(tx *gorm.DB, serverID, fromUserID, toUser
 // and admits the old AgentSecret on the happy "owner match" path —
 // bypassing the bounded pending-tolerance contract.
 func (c *ServerTransferClass) Register(t *model.ServerTransfer) {
-	if s, ok := ServerShared.Get(t.ServerID); ok && s != nil {
-		// SetUserID over atomic write — auth.go hot path concurrently
-		// reads this field; a plain assignment would be a data race.
-		s.SetUserID(t.ToUserID)
-	}
+	// SetUserID uses an atomic write because auth.go reads this hot-path field
+	// concurrently; ServerClass also serializes it with service reports.
+	ServerShared.setUserID(t.ServerID, t.ToUserID)
 
 	c.mu.Lock()
 	c.pending[t.ServerID] = t
@@ -1103,7 +1105,7 @@ func (c *ServerTransferClass) revertTransition(transferID uint64, newStatus mode
 	// back to a possibly-deleted FromUserID (regression pinned by
 	// TestOnUserDeleteCancelsPendingTransfersAwayFromDeletedUser).
 	var transitionedByThisCall bool
-		err := DB.Transaction(func(tx *gorm.DB) error {
+	err := DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.First(&t, transferID).Error; err != nil {
 			return err
 		}
@@ -1159,9 +1161,7 @@ func (c *ServerTransferClass) revertTransition(transferID uint64, newStatus mode
 	// no longer admits the destination user's global AgentSecret via
 	// ServerShared.GetUserID() == userId on the happy "owner match" path.
 	if transitionedByThisCall {
-		if s, ok := ServerShared.Get(t.ServerID); ok && s != nil {
-			s.SetUserID(t.FromUserID)
-		}
+		ServerShared.setUserID(t.ServerID, t.FromUserID)
 	}
 
 	// Self-heal: any non-Pending DB status invalidates the in-memory entry —

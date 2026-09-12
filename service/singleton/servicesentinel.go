@@ -46,6 +46,12 @@ type _TodayStatsOfService struct {
 
 type serviceResponseData = _TodayStatsOfService
 
+type pingStore struct {
+	count        int
+	ping         float64
+	successCount int
+}
+
 type serviceTaskStatus struct {
 	lastStatus          uint8
 	t                   time.Time
@@ -82,10 +88,14 @@ type ServiceSentinel struct {
 	serviceCurrentStatusData     map[uint64]*serviceTaskStatus    // 褰撳墠浠诲姟缁撴灉缂撳瓨
 	serviceResponseDataStore     map[uint64]serviceResponseData   // 褰撳墠鏁版嵁
 
-	latestResultLock sync.RWMutex
-	latestResults    map[uint64]map[uint64]model.ServiceLatestResult   // [service_id][server_id]
-	recentResults    map[uint64]map[uint64][]model.ServiceLatestResult // [server_id][service_id], bounded live event streams
-	tlsCertCache     map[uint64]string
+	latestResultLock                      sync.RWMutex
+	latestResults                         map[uint64]map[uint64]model.ServiceLatestResult   // [service_id][server_id]
+	recentResults                         map[uint64]map[uint64][]model.ServiceLatestResult // [server_id][service_id], bounded live event streams
+	serviceResponsePing                   map[uint64]map[uint64]*pingStore                  // guarded by serviceResponseDataStoreLock; [service_id] -> ClientID -> delay
+	tlsCertCache                          map[uint64]string                                 // guarded by serviceResponseDataStoreLock
+	serviceReportValidatedHook            func(uint64)
+	loadStatsResponseLockedHook           func()
+	serviceReportBeforeTLSSideEffectsHook func(uint64)
 
 	historyCheckpointLock sync.Mutex
 	historyCheckpoints    map[serviceHistoryCheckpointKey]serviceHistoryCheckpoint
@@ -119,6 +129,7 @@ func NewServiceSentinel(serviceSentinelDispatchBus chan<- *model.Service) (*Serv
 		serviceResponseDataStore: make(map[uint64]serviceResponseData),
 		latestResults:            make(map[uint64]map[uint64]model.ServiceLatestResult),
 		recentResults:            make(map[uint64]map[uint64][]model.ServiceLatestResult),
+		serviceResponsePing:      make(map[uint64]map[uint64]*pingStore),
 		historyCheckpoints:       make(map[serviceHistoryCheckpointKey]serviceHistoryCheckpoint),
 		services:                 make(map[uint64]*model.Service),
 		tlsCertCache:             make(map[uint64]string),
@@ -221,7 +232,15 @@ func (ss *ServiceSentinel) loadServiceHistory() error {
 		return err
 	}
 
+	validServices := services[:0]
 	for _, service := range services {
+		if err := model.ValidateServiceMonitorType(uint64(service.Type)); err != nil {
+			// Existing databases may contain values written before Service.Type was
+			// constrained. Quarantine them in the database for operator review, but
+			// never register a cron job that could dispatch a privileged Agent task.
+			log.Printf("NEZHA>> quarantining service %d: %v", service.ID, err)
+			continue
+		}
 		task := service
 		// 閫氳繃cron瀹氭椂灏嗘湇鍔＄洃鎺т换鍔′紶閫掔粰浠诲姟璋冨害绠￠亾
 		service.CronJobID, err = CronShared.AddFunc(task.CronSpec(), func() {
@@ -234,7 +253,9 @@ func (ss *ServiceSentinel) loadServiceHistory() error {
 		ss.serviceCurrentStatusData[service.ID] = new(serviceTaskStatus)
 		ss.serviceCurrentStatusData[service.ID].result = make([]*pb.TaskResult, 0, _CurrentStatusSize)
 		ss.serviceStatusToday[service.ID] = &_TodayStatsOfService{}
+		validServices = append(validServices, service)
 	}
+	services = validServices
 	ss.serviceList = services
 	sortServices(ss.serviceList)
 
@@ -351,6 +372,13 @@ func (ss *ServiceSentinel) loadTodayStats(today time.Time) {
 }
 
 func (ss *ServiceSentinel) Update(m *model.Service) error {
+	if m == nil {
+		return fmt.Errorf("service is nil")
+	}
+	if err := model.ValidateServiceMonitorType(uint64(m.Type)); err != nil {
+		return err
+	}
+
 	ss.serviceResponseDataStoreLock.Lock()
 	defer ss.serviceResponseDataStoreLock.Unlock()
 	ss.monthlyStatusLock.Lock()
@@ -401,11 +429,13 @@ func (ss *ServiceSentinel) Delete(ids []uint64) {
 	for _, id := range ids {
 		delete(ss.serviceCurrentStatusData, id)
 		delete(ss.serviceResponseDataStore, id)
+		delete(ss.serviceResponsePing, id)
 		delete(ss.tlsCertCache, id)
 		delete(ss.serviceStatusToday, id)
 
-		// 鍋滄帀瀹氭椂浠诲姟
-		CronShared.Remove(ss.services[id].CronJobID)
+		if svc := ss.services[id]; svc != nil {
+			CronShared.Remove(svc.CronJobID)
+		}
 		delete(ss.services, id)
 
 		delete(ss.monthlyStatus, id)
@@ -413,12 +443,15 @@ func (ss *ServiceSentinel) Delete(ids []uint64) {
 }
 
 func (ss *ServiceSentinel) LoadStats() map[uint64]*serviceResponseItem {
-	ss.servicesLock.RLock()
-	defer ss.servicesLock.RUnlock()
 	ss.serviceResponseDataStoreLock.RLock()
 	defer ss.serviceResponseDataStoreLock.RUnlock()
+	if ss.loadStatsResponseLockedHook != nil {
+		ss.loadStatsResponseLockedHook()
+	}
 	ss.monthlyStatusLock.Lock()
 	defer ss.monthlyStatusLock.Unlock()
+	ss.servicesLock.RLock()
+	defer ss.servicesLock.RUnlock()
 
 	// 鍒锋柊鏈€鏂颁竴澶╃殑鏁版嵁
 	for k := range ss.services {
@@ -453,11 +486,6 @@ func (ss *ServiceSentinel) CopyStats() map[uint64]model.ServiceResponseItem {
 
 	sri := make(map[uint64]model.ServiceResponseItem)
 	for k, service := range stats {
-		if service.service.HideForGuest {
-			delete(stats, k)
-			continue
-		}
-
 		service.ServiceName = service.service.Name
 		sri[k] = service.ServiceResponseItem
 	}
@@ -549,232 +577,260 @@ func (ss *ServiceSentinel) Close() {
 func (ss *ServiceSentinel) worker() {
 	// 浠庢湇鍔＄姸鎬佹眹鎶ョ閬撹幏鍙栨眹鎶ョ殑鏈嶅姟鏁版嵁
 	for r := range ss.serviceReportChannel {
-		cs, _ := ss.Get(r.Data.GetId())
-		reporter, _ := ServerShared.Get(r.Reporter)
-		// 鍏ョ珯缁撴灉蹇呴』鍖归厤鍑虹珯浠诲姟娲惧彂杈圭晫锛岄伩鍏?agent 浼€犲叾浠栨湇鍔?ID 鍐欏叆鐩戞帶鐘舵€併€?
-		if !canReportServiceResult(cs, reporter, r.Data.GetType()) {
-			log.Printf("NEZHA>> Incorrect service monitor report %+v", r)
-			continue
-		}
+		serverShared := ServerShared
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					log.Printf("NEZHA>> Service monitor report processing panicked: %v", recovered)
+				}
+			}()
+			ss.processReport(r, serverShared)
+		}()
+	}
+}
 
-		mh := r.Data
-		now := time.Now()
-		packetLoss := 100.0
-		if mh.Successful {
-			packetLoss = 0
+func (ss *ServiceSentinel) processReport(r ReportData, serverShared *ServerClass) {
+	serverShared.lockLifecycleRead()
+	defer serverShared.unlockLifecycleRead()
+
+	cs, _ := ss.Get(r.Data.GetId())
+	reporter, _ := serverShared.Get(r.Reporter)
+	// 鍏ョ珯缁撴灉蹇呴』鍖归厤鍑虹珯浠诲姟娲惧彂杈圭晫锛岄伩鍏?agent 浼€犲叾浠栨湇鍔?ID 鍐欏叆鐩戞帶鐘舵€併€?
+	if !canReportServiceResult(cs, reporter, r.Data.GetType()) {
+		log.Printf("NEZHA>> Incorrect service monitor report %+v", r)
+		return
+	}
+
+	if ss.serviceReportValidatedHook != nil {
+		ss.serviceReportValidatedHook(r.Data.GetId())
+	}
+
+	mh := r.Data
+	m := serverShared.GetList()
+	ss.serviceResponseDataStoreLock.Lock()
+	defer ss.serviceResponseDataStoreLock.Unlock()
+	serviceStatusToday := ss.serviceStatusToday[mh.GetId()]
+	serviceCurrentStatusData := ss.serviceCurrentStatusData[mh.GetId()]
+	currentService, serviceExists := ss.Get(mh.GetId())
+	if serviceStatusToday == nil || serviceCurrentStatusData == nil || !serviceExists ||
+		!canReportServiceResult(currentService, reporter, mh.GetType()) {
+		return
+	}
+	cs = currentService
+	now := time.Now()
+	packetLoss := 100.0
+	if mh.Successful {
+		packetLoss = 0
+	}
+	if TSDBEnabled() {
+		if err := TSDBShared.WriteServiceMetrics(&tsdb.ServiceMetrics{
+			ServiceID: mh.GetId(), ServerID: r.Reporter, Timestamp: now,
+			Delay: float64(mh.Delay), Successful: mh.Successful, PacketLoss: packetLoss,
+			ErrorCode: classifyServiceError(mh.Successful, mh.Data),
+		}); err != nil {
+			log.Printf("NEZHA>> Failed to save service monitor metrics to TSDB: %v", err)
 		}
-		if TSDBEnabled() {
-			if err := TSDBShared.WriteServiceMetrics(&tsdb.ServiceMetrics{
-				ServiceID: mh.GetId(), ServerID: r.Reporter, Timestamp: now,
-				Delay: float64(mh.Delay), Successful: mh.Successful, PacketLoss: packetLoss,
-				ErrorCode: classifyServiceError(mh.Successful, mh.Data),
-			}); err != nil {
-				log.Printf("NEZHA>> Failed to save service monitor metrics to TSDB: %v", err)
-			}
-			ss.persistServiceHistoryCheckpoint(
-				mh.GetId(), r.Reporter, now, float64(mh.Delay), mh.Successful, mh.Data,
-			)
-		} else if err := DB.Create(&model.ServiceHistory{
-			ServiceID: mh.GetId(), ServerID: r.Reporter, CreatedAt: now,
-			AvgDelay: float64(mh.Delay), Data: mh.Data,
-			Up: func() uint64 {
-				if mh.Successful {
-					return 1
-				}
-				return 0
-			}(),
-			Down: func() uint64 {
-				if mh.Successful {
-					return 0
-				}
+		ss.persistServiceHistoryCheckpoint(
+			mh.GetId(), r.Reporter, now, float64(mh.Delay), mh.Successful, mh.Data,
+		)
+	} else if err := DB.Create(&model.ServiceHistory{
+		ServiceID: mh.GetId(), ServerID: r.Reporter, CreatedAt: now,
+		AvgDelay: float64(mh.Delay), Data: mh.Data,
+		Up: func() uint64 {
+			if mh.Successful {
 				return 1
-			}(),
-		}).Error; err != nil {
-			log.Printf("NEZHA>> Failed to save service monitor metrics: %v", err)
-		}
-		ss.setLatestResult(cs, reporter, mh, now)
-
-		ss.serviceResponseDataStoreLock.Lock()
-		// 鍐欏叆褰撳ぉ鐘舵€?
-		if mh.Successful {
-			ss.serviceStatusToday[mh.GetId()].Delay = (ss.serviceStatusToday[mh.
-				GetId()].Delay*float64(ss.serviceStatusToday[mh.GetId()].Up) +
-				float64(mh.Delay)) / float64(ss.serviceStatusToday[mh.GetId()].Up+1)
-			ss.serviceStatusToday[mh.GetId()].Up++
-		} else {
-			ss.serviceStatusToday[mh.GetId()].Down++
-		}
-
-		currentTime := time.Now()
-		if ss.serviceCurrentStatusData[mh.GetId()].t.IsZero() {
-			ss.serviceCurrentStatusData[mh.GetId()].t = currentTime
-		}
-
-		// Record current status data.
-		if ss.serviceCurrentStatusData[mh.GetId()].t.Before(currentTime) {
-			sampleInterval := time.Duration(cs.Duration) * time.Second
-			if sampleInterval <= 0 {
-				sampleInterval = 30 * time.Second
 			}
-			ss.serviceCurrentStatusData[mh.GetId()].t = currentTime.Add(sampleInterval)
-			ss.serviceCurrentStatusData[mh.GetId()].result = append(ss.serviceCurrentStatusData[mh.GetId()].result, mh)
-		}
-
-		// 鏇存柊褰撳墠鐘舵€?
-		ss.serviceResponseDataStore[mh.GetId()] = serviceResponseData{}
-
-		// 姘歌繙鏄渶鏂扮殑 30 涓暟鎹殑鐘舵€?[01:00, 02:00, 03:00] -> [04:00, 02:00, 03: 00]
-		for _, cs := range ss.serviceCurrentStatusData[mh.GetId()].result {
-			if cs.GetId() > 0 {
-				rd := ss.serviceResponseDataStore[mh.GetId()]
-				if cs.Successful {
-					rd.Up++
-					rd.Delay = (rd.Delay*float64(rd.Up-1) + float64(cs.Delay)) / float64(rd.Up)
-				} else {
-					rd.Down++
-				}
-				ss.serviceResponseDataStore[mh.GetId()] = rd
+			return 0
+		}(),
+		Down: func() uint64 {
+			if mh.Successful {
+				return 0
 			}
+			return 1
+		}(),
+	}).Error; err != nil {
+		log.Printf("NEZHA>> Failed to save service monitor metrics: %v", err)
+	}
+	ss.setLatestResult(cs, reporter, mh, now)
+
+	// 鍐欏叆褰撳ぉ鐘舵€?
+	if mh.Successful {
+		ss.serviceStatusToday[mh.GetId()].Delay = (ss.serviceStatusToday[mh.
+			GetId()].Delay*float64(ss.serviceStatusToday[mh.GetId()].Up) +
+			float64(mh.Delay)) / float64(ss.serviceStatusToday[mh.GetId()].Up+1)
+		ss.serviceStatusToday[mh.GetId()].Up++
+	} else {
+		ss.serviceStatusToday[mh.GetId()].Down++
+	}
+
+	currentTime := time.Now()
+	if ss.serviceCurrentStatusData[mh.GetId()].t.IsZero() {
+		ss.serviceCurrentStatusData[mh.GetId()].t = currentTime
+	}
+
+	// Record current status data.
+	if ss.serviceCurrentStatusData[mh.GetId()].t.Before(currentTime) {
+		sampleInterval := time.Duration(cs.Duration) * time.Second
+		if sampleInterval <= 0 {
+			sampleInterval = 30 * time.Second
 		}
+		ss.serviceCurrentStatusData[mh.GetId()].t = currentTime.Add(sampleInterval)
+		ss.serviceCurrentStatusData[mh.GetId()].result = append(ss.serviceCurrentStatusData[mh.GetId()].result, mh)
+	}
 
-		status := ss.serviceCurrentStatusData[mh.GetId()]
-		if status.lastStatus == 0 {
-			status.lastStatus = StatusGood
-		}
+	// 鏇存柊褰撳墠鐘舵€?
+	ss.serviceResponseDataStore[mh.GetId()] = serviceResponseData{}
 
-		stateCode := status.lastStatus
-		triggerFailureForChangedIP := false
-
-		if mh.Successful {
-			status.consecutiveFailures = 0
-			status.lastFailureIP = ""
-
-			if status.inFailureState {
-				status.inFailureState = false
-				stateCode = StatusGood
+	// 姘歌繙鏄渶鏂扮殑 30 涓暟鎹殑鐘舵€?[01:00, 02:00, 03:00] -> [04:00, 02:00, 03: 00]
+	for _, cs := range ss.serviceCurrentStatusData[mh.GetId()].result {
+		if cs.GetId() > 0 {
+			rd := ss.serviceResponseDataStore[mh.GetId()]
+			if cs.Successful {
+				rd.Up++
+				rd.Delay = (rd.Delay*float64(rd.Up-1) + float64(cs.Delay)) / float64(rd.Up)
+			} else {
+				rd.Down++
 			}
-		} else {
-			status.consecutiveFailures++
+			ss.serviceResponseDataStore[mh.GetId()] = rd
+		}
+	}
 
-			currentFailureIP := extractTCPFailureIP(mh.Data)
-			failureThreshold := int(cs.EffectiveFailureThreshold())
-			if !status.inFailureState && status.consecutiveFailures >= failureThreshold {
-				status.inFailureState = true
+	status := ss.serviceCurrentStatusData[mh.GetId()]
+	if status.lastStatus == 0 {
+		status.lastStatus = StatusGood
+	}
+
+	stateCode := status.lastStatus
+	triggerFailureForChangedIP := false
+
+	if mh.Successful {
+		status.consecutiveFailures = 0
+		status.lastFailureIP = ""
+
+		if status.inFailureState {
+			status.inFailureState = false
+			stateCode = StatusGood
+		}
+	} else {
+		status.consecutiveFailures++
+
+		currentFailureIP := extractTCPFailureIP(mh.Data)
+		failureThreshold := int(cs.EffectiveFailureThreshold())
+		if !status.inFailureState && status.consecutiveFailures >= failureThreshold {
+			status.inFailureState = true
+			status.lastFailureIP = currentFailureIP
+			stateCode = StatusDown
+		} else if status.inFailureState {
+			if currentFailureIP != "" && status.lastFailureIP != "" && currentFailureIP != status.lastFailureIP {
 				status.lastFailureIP = currentFailureIP
-				stateCode = StatusDown
-			} else if status.inFailureState {
-				if currentFailureIP != "" && status.lastFailureIP != "" && currentFailureIP != status.lastFailureIP {
-					status.lastFailureIP = currentFailureIP
-					triggerFailureForChangedIP = true
-				} else if status.lastFailureIP == "" && currentFailureIP != "" {
-					status.lastFailureIP = currentFailureIP
-				}
+				triggerFailureForChangedIP = true
+			} else if status.lastFailureIP == "" && currentFailureIP != "" {
+				status.lastFailureIP = currentFailureIP
 			}
 		}
+	}
 
-		if len(ss.serviceCurrentStatusData[mh.GetId()].result) == _CurrentStatusSize {
-			ss.serviceCurrentStatusData[mh.GetId()].t = currentTime
-			if !TSDBEnabled() {
-				rd := ss.serviceResponseDataStore[mh.GetId()]
-				if err := DB.Create(&model.ServiceHistory{
-					ServiceID: mh.GetId(),
-					AvgDelay:  rd.Delay,
-					Data:      mh.Data,
-					Up:        rd.Up,
-					Down:      rd.Down,
-				}).Error; err != nil {
-					log.Printf("NEZHA>> Failed to save service monitor metrics: %v", err)
-				}
+	if len(ss.serviceCurrentStatusData[mh.GetId()].result) == _CurrentStatusSize {
+		ss.serviceCurrentStatusData[mh.GetId()].t = currentTime
+		if !TSDBEnabled() {
+			rd := ss.serviceResponseDataStore[mh.GetId()]
+			if err := DB.Create(&model.ServiceHistory{
+				ServiceID: mh.GetId(),
+				AvgDelay:  rd.Delay,
+				Data:      mh.Data,
+				Up:        rd.Up,
+				Down:      rd.Down,
+			}).Error; err != nil {
+				log.Printf("NEZHA>> Failed to save service monitor metrics: %v", err)
 			}
-			ss.serviceCurrentStatusData[mh.GetId()].result = ss.serviceCurrentStatusData[mh.GetId()].result[:0]
 		}
+		ss.serviceCurrentStatusData[mh.GetId()].result = ss.serviceCurrentStatusData[mh.GetId()].result[:0]
+	}
 
-		cs, _ = ss.Get(mh.GetId())
-		m := ServerShared.GetList()
-		// 寤惰繜鎶ヨ
-		if mh.Delay > 0 {
-			delayCheck(&r, m, cs, mh)
-		}
+	// 寤惰繜鎶ヨ
+	if mh.Delay > 0 {
+		delayCheck(&r, m, cs, mh)
+	}
 
-		// State changes:
-		// - The configured number of consecutive failures enters Down once.
-		// - During failure, a changed resolved IP triggers one extra failure task.
-		// - 1 successful check recovers to Good once.
-		if stateCode != status.lastStatus {
-			lastStatus := status.lastStatus
-			status.lastStatus = stateCode
+	// State changes:
+	// - The configured number of consecutive failures enters Down once.
+	// - During failure, a changed resolved IP triggers one extra failure task.
+	// - 1 successful check recovers to Good once.
+	if stateCode != status.lastStatus {
+		lastStatus := status.lastStatus
+		status.lastStatus = stateCode
 
-			notifyCheck(&r, m, cs, mh, lastStatus, stateCode)
-		} else if triggerFailureForChangedIP {
-			notifyCheck(&r, m, cs, mh, StatusGood, StatusDown)
-		}
-		ss.serviceResponseDataStoreLock.Unlock()
-
-		// TLS 璇佷功鎶ヨ
-		var errMsg string
-		if strings.HasPrefix(mh.Data, "SSL\u8bc1\u4e66\u9519\u8bef\uff1a") {
-			// i/o timeout銆乧onnection timeout銆丒OF 閿欒
-			if !strings.HasSuffix(mh.Data, "timeout") &&
-				!strings.HasSuffix(mh.Data, "EOF") &&
-				!strings.HasSuffix(mh.Data, "timed out") {
-				errMsg = mh.Data
-				if cs.Notify {
-					muteLabel := NotificationMuteLabel.ServiceTLS(mh.GetId(), "network")
-					go NotificationShared.SendNotification(cs.NotificationGroupID, Localizer.Tf("[TLS] Fetch cert info failed, Reporter: %s, Error: %s", cs.Name, errMsg), muteLabel)
-				}
+		notifyCheck(&r, m, cs, mh, lastStatus, stateCode)
+	} else if triggerFailureForChangedIP {
+		notifyCheck(&r, m, cs, mh, StatusGood, StatusDown)
+	}
+	if ss.serviceReportBeforeTLSSideEffectsHook != nil {
+		ss.serviceReportBeforeTLSSideEffectsHook(mh.GetId())
+	}
+	// TLS 璇佷功鎶ヨ
+	var errMsg string
+	if strings.HasPrefix(mh.Data, "SSL\u8bc1\u4e66\u9519\u8bef\uff1a") {
+		// i/o timeout銆乧onnection timeout銆丒OF 閿欒
+		if !strings.HasSuffix(mh.Data, "timeout") &&
+			!strings.HasSuffix(mh.Data, "EOF") &&
+			!strings.HasSuffix(mh.Data, "timed out") {
+			errMsg = mh.Data
+			if cs.Notify {
+				muteLabel := NotificationMuteLabel.ServiceTLS(mh.GetId(), "network")
+				go NotificationShared.SendNotification(cs.NotificationGroupID, Localizer.Tf("[TLS] Fetch cert info failed, Reporter: %s, Error: %s", cs.Name, errMsg), muteLabel)
 			}
-		} else {
-			// 娓呴櫎缃戠粶閿欒闈欓煶缂撳瓨
-			NotificationShared.UnMuteNotification(cs.NotificationGroupID, NotificationMuteLabel.ServiceTLS(mh.GetId(), "network"))
+		}
+	} else {
+		// 娓呴櫎缃戠粶閿欒闈欓煶缂撳瓨
+		NotificationShared.UnMuteNotification(cs.NotificationGroupID, NotificationMuteLabel.ServiceTLS(mh.GetId(), "network"))
 
-			var newCert = strings.Split(mh.Data, "|")
-			if len(newCert) > 1 {
-				enableNotify := cs.Notify
+		var newCert = strings.Split(mh.Data, "|")
+		if len(newCert) > 1 {
+			enableNotify := cs.Notify
 
-				// 棣栨鑾峰彇璇佷功淇℃伅鏃讹紝缂撳瓨璇佷功淇℃伅
-				if ss.tlsCertCache[mh.GetId()] == "" {
-					ss.tlsCertCache[mh.GetId()] = mh.Data
+			// 棣栨鑾峰彇璇佷功淇℃伅鏃讹紝缂撳瓨璇佷功淇℃伅
+			if ss.tlsCertCache[mh.GetId()] == "" {
+				ss.tlsCertCache[mh.GetId()] = mh.Data
+			}
+
+			oldCert := strings.Split(ss.tlsCertCache[mh.GetId()], "|")
+			isCertChanged := false
+			expiresOld, _ := time.Parse("2006-01-02 15:04:05 -0700 MST", oldCert[1])
+			expiresNew, _ := time.Parse("2006-01-02 15:04:05 -0700 MST", newCert[1])
+
+			// 璇佷功鍙樻洿鏃讹紝鏇存柊缂撳瓨
+			if oldCert[0] != newCert[0] && !expiresNew.Equal(expiresOld) {
+				isCertChanged = true
+				ss.tlsCertCache[mh.GetId()] = mh.Data
+			}
+
+			notificationGroupID := cs.NotificationGroupID
+			serviceName := cs.Name
+
+			// 闇€瑕佸彂閫佹彁閱?
+			if enableNotify {
+				// 璇佷功杩囨湡鎻愰啋
+				if expiresNew.Before(time.Now().AddDate(0, 0, 7)) {
+					expiresTimeStr := expiresNew.Format("2006-01-02 15:04:05")
+					errMsg = Localizer.Tf(
+						"The TLS certificate will expire within seven days. Expiration time: %s",
+						expiresTimeStr,
+					)
+
+					// 闈欓煶瑙勫垯锛?鏈嶅姟id+璇佷功杩囨湡鏃堕棿
+					// 鐢ㄤ簬閬垮厤澶氫釜鐩戞祴鐐瑰鐩稿悓璇佷功鍚屾椂鎶ヨ
+					muteLabel := NotificationMuteLabel.ServiceTLS(mh.GetId(), fmt.Sprintf("expire_%s", expiresTimeStr))
+					go NotificationShared.SendNotification(notificationGroupID, fmt.Sprintf("[TLS] %s %s", serviceName, errMsg), muteLabel)
 				}
 
-				oldCert := strings.Split(ss.tlsCertCache[mh.GetId()], "|")
-				isCertChanged := false
-				expiresOld, _ := time.Parse("2006-01-02 15:04:05 -0700 MST", oldCert[1])
-				expiresNew, _ := time.Parse("2006-01-02 15:04:05 -0700 MST", newCert[1])
+				// 璇佷功鍙樻洿鎻愰啋
+				if isCertChanged {
+					errMsg = Localizer.Tf(
+						"TLS certificate changed, old: issuer %s, expires at %s; new: issuer %s, expires at %s",
+						oldCert[0], expiresOld.Format("2006-01-02 15:04:05"), newCert[0], expiresNew.Format("2006-01-02 15:04:05"))
 
-				// 璇佷功鍙樻洿鏃讹紝鏇存柊缂撳瓨
-				if oldCert[0] != newCert[0] && !expiresNew.Equal(expiresOld) {
-					isCertChanged = true
-					ss.tlsCertCache[mh.GetId()] = mh.Data
-				}
-
-				notificationGroupID := cs.NotificationGroupID
-				serviceName := cs.Name
-
-				// 闇€瑕佸彂閫佹彁閱?
-				if enableNotify {
-					// 璇佷功杩囨湡鎻愰啋
-					if expiresNew.Before(time.Now().AddDate(0, 0, 7)) {
-						expiresTimeStr := expiresNew.Format("2006-01-02 15:04:05")
-						errMsg = Localizer.Tf(
-							"The TLS certificate will expire within seven days. Expiration time: %s",
-							expiresTimeStr,
-						)
-
-						// 闈欓煶瑙勫垯锛?鏈嶅姟id+璇佷功杩囨湡鏃堕棿
-						// 鐢ㄤ簬閬垮厤澶氫釜鐩戞祴鐐瑰鐩稿悓璇佷功鍚屾椂鎶ヨ
-						muteLabel := NotificationMuteLabel.ServiceTLS(mh.GetId(), fmt.Sprintf("expire_%s", expiresTimeStr))
-						go NotificationShared.SendNotification(notificationGroupID, fmt.Sprintf("[TLS] %s %s", serviceName, errMsg), muteLabel)
-					}
-
-					// 璇佷功鍙樻洿鎻愰啋
-					if isCertChanged {
-						errMsg = Localizer.Tf(
-							"TLS certificate changed, old: issuer %s, expires at %s; new: issuer %s, expires at %s",
-							oldCert[0], expiresOld.Format("2006-01-02 15:04:05"), newCert[0], expiresNew.Format("2006-01-02 15:04:05"))
-
-						// 璇佷功鍙樻洿鍚庝細鑷姩鏇存柊缂撳瓨锛屾墍浠ヤ笉闇€瑕侀潤闊?
-						go NotificationShared.SendNotification(notificationGroupID, fmt.Sprintf("[TLS] %s %s", serviceName, errMsg), "")
-					}
+					// 璇佷功鍙樻洿鍚庝細鑷姩鏇存柊缂撳瓨锛屾墍浠ヤ笉闇€瑕侀潤闊?
+					go NotificationShared.SendNotification(notificationGroupID, fmt.Sprintf("[TLS] %s %s", serviceName, errMsg), "")
 				}
 			}
 		}
@@ -785,18 +841,20 @@ func delayCheck(r *ReportData, m map[uint64]*model.Server, ss *model.Service, mh
 	if !ss.LatencyNotify {
 		return
 	}
+	reporterServer := m[r.Reporter]
+	if reporterServer == nil {
+		return
+	}
 
 	notificationGroupID := ss.NotificationGroupID
 	minMuteLabel := NotificationMuteLabel.ServiceLatencyMin(mh.GetId())
 	maxMuteLabel := NotificationMuteLabel.ServiceLatencyMax(mh.GetId())
 	if mh.Delay > ss.MaxLatency {
 		// 寤惰繜瓒呰繃鏈€澶у€?
-		reporterServer := m[r.Reporter]
 		msg := Localizer.Tf("[Latency] %s %2f > %2f, Reporter: %s", ss.Name, mh.Delay, ss.MaxLatency, reporterServer.Name)
 		go NotificationShared.SendNotification(notificationGroupID, msg, minMuteLabel)
 	} else if mh.Delay < ss.MinLatency {
 		// 寤惰繜浣庝簬鏈€灏忓€?
-		reporterServer := m[r.Reporter]
 		msg := Localizer.Tf("[Latency] %s %2f < %2f, Reporter: %s", ss.Name, mh.Delay, ss.MinLatency, reporterServer.Name)
 		go NotificationShared.SendNotification(notificationGroupID, msg, maxMuteLabel)
 	} else {
@@ -835,10 +893,11 @@ func extractTCPFailureIP(data string) string {
 
 func notifyCheck(r *ReportData, m map[uint64]*model.Server,
 	ss *model.Service, mh *pb.TaskResult, lastStatus, stateCode uint8) {
+	reporterServer := m[r.Reporter]
+
 	// 鍒ゆ柇鏄惁闇€瑕佸彂閫侀€氱煡
 	isNeedSendNotification := ss.Notify && (lastStatus != 0 || stateCode == StatusDown)
-	if isNeedSendNotification {
-		reporterServer := m[r.Reporter]
+	if isNeedSendNotification && reporterServer != nil {
 		notificationGroupID := ss.NotificationGroupID
 		notificationMsg := Localizer.Tf("[%s] %s Reporter: %s, Error: %s", StatusCodeToString(stateCode), ss.Name, reporterServer.Name, mh.Data)
 		muteLabel := NotificationMuteLabel.ServiceStateChanged(mh.GetId())
@@ -853,8 +912,7 @@ func notifyCheck(r *ReportData, m map[uint64]*model.Server,
 
 	// 鍒ゆ柇鏄惁闇€瑕佽Е鍙戜换鍔?
 	isNeedTriggerTask := ss.EnableTriggerTask && lastStatus != 0
-	if isNeedTriggerTask {
-		reporterServer := m[r.Reporter]
+	if isNeedTriggerTask && reporterServer != nil {
 		if stateCode == StatusGood && lastStatus != stateCode {
 			// 褰撳墠鐘舵€佹甯?鍓嶅簭鐘舵€侀潪姝ｅ父鏃?瑙﹀彂鎭㈠浠诲姟
 			go CronShared.SendTriggerTasks(ss.RecoverTriggerTasks, reporterServer.ID, ss.UserID)

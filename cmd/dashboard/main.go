@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"runtime/debug"
@@ -47,6 +46,12 @@ func initSystem(bus chan<- *model.Service) error {
 	if err := singleton.DB.Model(&model.User{}).Count(&usersCount).Error; err != nil {
 		return err
 	}
+	// Backward-compatible bootstrap state: existing installers and recovery
+	// procedures expect the first login on an empty database to be admin/admin.
+	// This is not a permanent credential or an authentication-bypass fallback;
+	// operators must complete initialization and change it before exposing the
+	// Dashboard. Replacing it requires a coordinated installer/migration flow so
+	// existing unattended installations are not locked out.
 	if usersCount == 0 {
 		hash, err := bcrypt.GenerateFromPassword([]byte("admin"), bcrypt.DefaultCost)
 		if err != nil {
@@ -140,9 +145,17 @@ func main() {
 		log.Fatal(err)
 	}
 
-	l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", singleton.Conf.ListenHost, singleton.Conf.ListenPort))
+	l, err := openDashboardListener("tcp", dashboardListenerAddress(singleton.Conf.ListenHost, singleton.Conf.ListenPort), dashboardHTTPListener)
 	if err != nil {
 		log.Fatal(err)
+	}
+	receiptListener, err := openReceiptGateListener()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if receiptListener != nil {
+		defer receiptListener.Close()
+		rpc.SetReceiptGateListener(receiptListener)
 	}
 
 	singleton.CleanMonitorHistory()
@@ -185,7 +198,7 @@ func main() {
 		log.Printf("NEZHA>> Dashboard::START ON %s:%d", singleton.Conf.ListenHost, singleton.Conf.ListenPort)
 		if singleton.Conf.HTTPS.ListenPort != 0 {
 			go func() {
-				errChan <- muxServerHTTPS.ListenAndServeTLS(singleton.Conf.HTTPS.TLSCertPath, singleton.Conf.HTTPS.TLSKeyPath)
+				errChan <- serveDashboardHTTPS(muxServerHTTPS, singleton.Conf.HTTPS.TLSCertPath, singleton.Conf.HTTPS.TLSKeyPath)
 			}()
 			log.Printf("NEZHA>> Dashboard::START ON %s:%d", singleton.Conf.ListenHost, singleton.Conf.HTTPS.ListenPort)
 		}
@@ -195,6 +208,7 @@ func main() {
 		return <-errChan
 	}, func(c context.Context) error {
 		log.Println("NEZHA>> Graceful::START")
+		rpc.CloseReceiptGate()
 		singleton.RecordTransferHourlyUsage()
 		singleton.CloseTSDB()
 		log.Println("NEZHA>> Graceful::END")

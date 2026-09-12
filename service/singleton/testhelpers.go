@@ -21,6 +21,9 @@ func NewEmptyServerClassForTest() *ServerClass {
 // InsertForTest 把一个 server 直接塞进内存表与排序快照，跳过 DB & InitServer 逻辑。
 // 调用方需保证 server.ID 已经设置。
 func (c *ServerClass) InsertForTest(s *model.Server) {
+	c.lockLifecycleWrite()
+	defer c.unlockLifecycleWrite()
+
 	c.listMu.Lock()
 	c.list[s.ID] = s
 	if s.UUID != "" {
@@ -44,6 +47,7 @@ func (c *DDNSClass) InsertForTest(p *model.DDNSProfile) {
 	c.listMu.Lock()
 	c.list[p.ID] = p
 	c.listMu.Unlock()
+	c.sortList()
 }
 
 // NewEmptyNotificationClassForTest 构造空 NotificationClass。
@@ -63,4 +67,5 @@ func (c *NotificationClass) InsertForTest(n *model.Notification) {
 	c.listMu.Lock()
 	c.list[n.ID] = n
 	c.listMu.Unlock()
+	c.sortList()
 }
