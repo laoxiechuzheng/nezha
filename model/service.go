@@ -201,6 +201,8 @@ type TaskFM struct {
 const (
 	ServiceCoverAll = iota
 	ServiceCoverIgnoreAll
+
+	DefaultServiceFailureThreshold uint16 = 7
 )
 
 type Service struct {
@@ -210,6 +212,7 @@ type Service struct {
 	Target              string `json:"target"`
 	SkipServersRaw      string `json:"-"`
 	Duration            uint64 `json:"duration"`
+	FailureThreshold    uint16 `gorm:"default:7;not null" json:"failure_threshold"`
 	DisplayIndex        int    `json:"display_index"` // 展示排序，越大越靠前
 	Notify              bool   `json:"notify,omitempty"`
 	NotificationGroupID uint64 `json:"notification_group_id"` // 当前服务监控所属的通知组 ID
@@ -229,6 +232,13 @@ type Service struct {
 
 	SkipServers map[uint64]bool `gorm:"-" json:"skip_servers"`
 	CronJobID   cron.EntryID    `gorm:"-" json:"-"`
+}
+
+func (m *Service) EffectiveFailureThreshold() uint16 {
+	if m.FailureThreshold == 0 {
+		return DefaultServiceFailureThreshold
+	}
+	return m.FailureThreshold
 }
 
 func (m *Service) PB() *pb.Task {

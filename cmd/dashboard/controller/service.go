@@ -709,6 +709,10 @@ func createService(c *gin.Context) (uint64, error) {
 	m.Notify = mf.Notify
 	m.NotificationGroupID = mf.NotificationGroupID
 	m.Duration = mf.Duration
+	m.FailureThreshold = mf.FailureThreshold
+	if m.FailureThreshold == 0 {
+		m.FailureThreshold = model.DefaultServiceFailureThreshold
+	}
 	m.LatencyNotify = mf.LatencyNotify
 	m.MinLatency = mf.MinLatency
 	m.MaxLatency = mf.MaxLatency
@@ -778,6 +782,10 @@ func updateService(c *gin.Context) (any, error) {
 	m.Notify = mf.Notify
 	m.NotificationGroupID = mf.NotificationGroupID
 	m.Duration = mf.Duration
+	m.FailureThreshold = mf.FailureThreshold
+	if m.FailureThreshold == 0 {
+		m.FailureThreshold = model.DefaultServiceFailureThreshold
+	}
 	m.LatencyNotify = mf.LatencyNotify
 	m.MinLatency = mf.MinLatency
 	m.MaxLatency = mf.MaxLatency

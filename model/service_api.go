@@ -10,6 +10,7 @@ type ServiceForm struct {
 	DisplayIndex        int             `json:"display_index,omitempty" default:"0"` // 展示排序，越大越靠前
 	Notify              bool            `json:"notify,omitempty" validate:"optional"`
 	Duration            uint64          `json:"duration,omitempty"`
+	FailureThreshold    uint16          `json:"failure_threshold,omitempty" default:"7" binding:"omitempty,min=1,max=100"`
 	MinLatency          float32         `json:"min_latency,omitempty" default:"0.0"`
 	MaxLatency          float32         `json:"max_latency,omitempty" default:"0.0"`
 	LatencyNotify       bool            `json:"latency_notify,omitempty" validate:"optional"`
