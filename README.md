@@ -162,18 +162,19 @@ add your theme to [service/singleton/frontend-templates.yaml](service/singleton/
 
 ### Building the dashboard with country flags
 
-The repository keeps only a `stub` GeoIP file. Before a local build, provide a free
-IPInfo token and prepare both the GeoIP database and frontend distributions:
+The repository keeps only a `stub` GeoIP file. Prepare the GeoIP database and
+frontend distributions before a local build:
 
 ```bash
-export IPINFO_TOKEN=your_ipinfo_token
 ./script/fetch-geoip.sh
 ./script/fetch-frontends.sh
 ```
 
-For GitHub Actions releases, add `IPINFO_TOKEN` as a repository Actions secret.
-The release workflow fails instead of publishing a dashboard without a valid
-GeoIP database.
+The script prefers `IPINFO_TOKEN` when it is set. Without a token it downloads a
+public GeoLite2-derived country database from Dreamacro/maxmind-geoip. Set
+`GEOIP_DB_URL` to use another compatible MaxMind DB mirror. Both record layouts
+are supported by the dashboard. The release workflow fails instead of
+publishing a dashboard without a valid GeoIP database.
 
 ## Star History
 

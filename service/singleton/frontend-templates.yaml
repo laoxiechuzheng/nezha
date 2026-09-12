@@ -2,7 +2,7 @@
   name: "LaoxieAdmin"
   repository: "https://github.com/laoxiechuzheng/admin-frontend"
   author: "laoxiechuzheng"
-  version: "v2.2.2-laoxie.1"
+  version: "v2.3.5-laoxie.1"
   is_admin: true
   is_official: true
 - path: "user-dist"
