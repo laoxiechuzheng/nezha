@@ -714,19 +714,14 @@ func (ss *ServiceSentinel) processReport(r ReportData, serverShared *ServerClass
 	} else {
 		status.consecutiveFailures++
 
-		currentFailureIP := extractTCPFailureIP(mh.Data)
+		currentFailureIP := extractServiceFailureIP(mh.Data)
 		failureThreshold := int(cs.EffectiveFailureThreshold())
 		if !status.inFailureState && status.consecutiveFailures >= failureThreshold {
 			status.inFailureState = true
 			status.lastFailureIP = currentFailureIP
 			stateCode = StatusDown
 		} else if status.inFailureState {
-			if currentFailureIP != "" && status.lastFailureIP != "" && currentFailureIP != status.lastFailureIP {
-				status.lastFailureIP = currentFailureIP
-				triggerFailureForChangedIP = true
-			} else if status.lastFailureIP == "" && currentFailureIP != "" {
-				status.lastFailureIP = currentFailureIP
-			}
+			triggerFailureForChangedIP = updateServiceFailureIP(status, currentFailureIP)
 		}
 	}
 
@@ -862,6 +857,41 @@ func delayCheck(r *ReportData, m map[uint64]*model.Server, ss *model.Service, mh
 		NotificationShared.UnMuteNotification(notificationGroupID, minMuteLabel)
 		NotificationShared.UnMuteNotification(notificationGroupID, maxMuteLabel)
 	}
+}
+
+func updateServiceFailureIP(status *serviceTaskStatus, currentFailureIP string) bool {
+	if !status.inFailureState || currentFailureIP == "" {
+		return false
+	}
+
+	previousFailureIP := status.lastFailureIP
+	status.lastFailureIP = currentFailureIP
+	return previousFailureIP != "" && previousFailureIP != currentFailureIP
+}
+
+func extractServiceFailureIP(data string) string {
+	if ip := extractTCPFailureIP(data); ip != "" {
+		return ip
+	}
+
+	const prefix = "icmp ping target="
+	idx := strings.Index(data, prefix)
+	if idx < 0 {
+		return ""
+	}
+
+	rest := data[idx+len(prefix):]
+	end := strings.Index(rest, ": ")
+	if end < 0 {
+		return ""
+	}
+
+	ip := net.ParseIP(rest[:end])
+	if ip == nil {
+		return ""
+	}
+
+	return ip.String()
 }
 
 func extractTCPFailureIP(data string) string {
