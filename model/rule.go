@@ -131,6 +131,15 @@ func (u *Rule) Snapshot(cycleTransferStats *CycleTransferStats, server *Server, 
 		return u.LastCycleStatus[server.ID]
 	}
 
+	if u.IsOfflineRule() {
+		duration, ok := u.DurationInt()
+		if !ok || duration <= 0 {
+			return true
+		}
+		runtime := server.RuntimeSnapshot()
+		return time.Since(runtime.LastReportAt) < time.Duration(duration)*time.Second
+	}
+
 	var src float64
 	runtime := server.RuntimeSnapshot()
 	if runtime.State == nil {
@@ -173,12 +182,6 @@ func (u *Rule) Snapshot(cycleTransferStats *CycleTransferStats, server *Server, 
 		src = float64(state.NetOutTransfer)
 	case "transfer_all":
 		src = float64(state.NetOutTransfer + state.NetInTransfer)
-	case "offline":
-		if runtime.LastActive.IsZero() {
-			src = 0
-		} else {
-			src = float64(runtime.LastActive.Unix())
-		}
 	case "transfer_in_cycle":
 		src = float64(utils.SubUintChecked(state.NetInTransfer, runtime.PrevTransferInSnapshot))
 		if u.CycleInterval != 0 {
@@ -252,9 +255,7 @@ func (u *Rule) Snapshot(cycleTransferStats *CycleTransferStats, server *Server, 
 		cycleTransferStats.To = u.GetTransferDurationEnd()
 	}
 
-	if u.Type == "offline" && float64(time.Now().Unix())-src > 6 {
-		return false
-	} else if (u.Max > 0 && src > u.Max) || (u.Min > 0 && src < u.Min) {
+	if (u.Max > 0 && src > u.Max) || (u.Min > 0 && src < u.Min) {
 		return false
 	}
 

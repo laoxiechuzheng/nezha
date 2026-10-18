@@ -30,10 +30,14 @@ func listDDNS(c *gin.Context) ([]*model.DDNSProfile, error) {
 		return nil, err
 	}
 
-	// 列表端点不回显写入态凭据：ddnsProfiles 是 copier 复制出的副本，置零安全，
-	// 不影响 singleton 内原始数据。
+	// ddnsProfiles 是 copier 复制出的副本，置零不影响 singleton 内原始数据。
+	// JWT 调用仅保留当前用户可访问配置的 AccessSecret；PAT 与无权配置继续脱敏，
+	// WebhookHeaders 则对列表调用始终脱敏。
+	_, isPAT := c.Get(model.CtxKeyAPIToken)
 	for _, p := range ddnsProfiles {
-		p.AccessSecret = ""
+		if isPAT || !p.HasPermission(c) {
+			p.AccessSecret = ""
+		}
 		p.WebhookHeaders = ""
 	}
 
@@ -149,7 +153,7 @@ func updateDDNS(c *gin.Context) (any, error) {
 	p.WebhookRequestType = df.WebhookRequestType
 	p.WebhookRequestBody = df.WebhookRequestBody
 
-	// 凭据在列表接口已脱敏，前端无法回填；空值视为"不修改"，保留旧值避免误清空。
+	// PAT 列表仍会脱敏凭据；兼容旧调用方回传空值：空值视为"不修改"，避免误清空。
 	if df.AccessSecret != "" {
 		p.AccessSecret = df.AccessSecret
 	}

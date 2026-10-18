@@ -57,6 +57,9 @@ func testCycleRules(t *testing.T) {
 	}
 }
 
+// An offline sample is false only after Snapshot has observed that the last
+// report is already at least Duration seconds old. Check therefore evaluates
+// the latest sample directly instead of counting Duration consecutive ticks.
 func testOfflineRules(t *testing.T) {
 	cases := []arSt{
 		{
@@ -68,10 +71,10 @@ func testOfflineRules(t *testing.T) {
 					},
 				},
 			},
-			msg:    "OfflineLast",
+			msg:    "OfflineLatestExpired",
 			points: append([][]bool{{true}}, repeat([]bool{false}, 9)...),
 			expD:   10,
-			exp:    true,
+			exp:    false,
 		},
 		{
 			rule: &AlertRule{
@@ -82,38 +85,38 @@ func testOfflineRules(t *testing.T) {
 					},
 				},
 			},
-			msg:    "OfflineMiddle",
-			points: mod(repeat([]bool{false}, 10), true, 5),
-			expD:   5,
-			exp:    true,
-		},
-		{
-			rule: &AlertRule{
-				Rules: []*Rule{
-					{
-						Type:     "offline",
-						Duration: 10,
-					},
-				},
-			},
-			msg:    "OfflineFirst",
+			msg:    "OfflineLatestHealthy",
 			points: mod(repeat([]bool{false}, 10), true, 9),
-			expD:   1,
-			exp:    true,
-		},
-		{
-			rule: &AlertRule{
-				Rules: []*Rule{
-					{
-						Type:     "offline",
-						Duration: 10,
-					},
-				},
-			},
-			msg:    "OfflineBoundCheck",
-			points: repeat([]bool{false}, 9),
 			expD:   0,
 			exp:    true,
+		},
+		{
+			rule: &AlertRule{
+				Rules: []*Rule{
+					{
+						Type:     "offline",
+						Duration: 10,
+					},
+				},
+			},
+			msg:    "OfflineSingleExpired",
+			points: [][]bool{{false}},
+			expD:   10,
+			exp:    false,
+		},
+		{
+			rule: &AlertRule{
+				Rules: []*Rule{
+					{
+						Type:     "offline",
+						Duration: 10,
+					},
+				},
+			},
+			msg:    "OfflineExpiredHistory",
+			points: repeat([]bool{false}, 9),
+			expD:   10,
+			exp:    false,
 		},
 	}
 
@@ -222,7 +225,7 @@ func testCombinedRules(t *testing.T) {
 			},
 			msg:    "OfflineGeneralOfflinePass",
 			points: slices.Concat(repeat([]bool{false, true}, 2), repeat([]bool{true, false}, 8)),
-			expD:   1,
+			expD:   0,
 			exp:    true,
 		},
 		{
@@ -427,7 +430,7 @@ func TestAlertRule_RetentionWindow(t *testing.T) {
 		{"single general", &AlertRule{Rules: []*Rule{{Type: "cpu", Duration: 10}}}, 10},
 		{"zero duration only", &AlertRule{Rules: []*Rule{{Type: "cpu", Duration: 0}}}, 0},
 		{"mixed picks max", &AlertRule{Rules: []*Rule{{Type: "cpu", Duration: 0}, {Type: "cpu", Duration: 7}}}, 7},
-		{"offline keeps Duration", &AlertRule{Rules: []*Rule{{Type: "offline", Duration: 30}}}, 30},
+		{"offline looks back one", &AlertRule{Rules: []*Rule{{Type: "offline", Duration: 30}}}, 1},
 		{"cycle looks back one", &AlertRule{Rules: []*Rule{{Type: "transfer_in_cycle"}}}, 1},
 	}
 	for _, c := range cases {
@@ -437,40 +440,35 @@ func TestAlertRule_RetentionWindow(t *testing.T) {
 	}
 }
 
-// TestAlertRule_OfflineRuleAccumulatesSamples is a regression guard for offline
-// alerts that never fire. Check's offline branch reads points[len-Duration:],
-// so it needs Duration samples retained; if RetentionWindow trims to 1 (as an
-// earlier fix wrongly did for offline rules), the window never reaches Duration,
-// boundCheck keeps returning "passed", and the offline alert never raises.
-func TestAlertRule_OfflineRuleAccumulatesSamples(t *testing.T) {
+// TestAlertRule_OfflineRuleUsesDurationScalar guards the configured Duration
+// boundary semantics: Snapshot already compares report age in seconds, so one
+// expired sample must fire immediately and a later healthy sample must recover.
+func TestAlertRule_OfflineRuleUsesDurationScalar(t *testing.T) {
 	const duration = 10
 	rule := &AlertRule{Rules: []*Rule{{Type: "offline", Duration: duration}}}
 
-	var samples [][]bool
-	var lastPassed bool
-	maxLen := 0
-	for tick := 0; tick < duration*3; tick++ {
-		samples = append(samples, []bool{false}) // offline sample
-		_, lastPassed = rule.Check(samples)
-		samples = trimSamples(samples, rule.RetentionWindow())
-		if len(samples) > maxLen {
-			maxLen = len(samples)
-		}
+	if got := rule.RetentionWindow(); got != 1 {
+		t.Fatalf("offline RetentionWindow()=%d want 1", got)
 	}
 
-	if maxLen < duration {
-		t.Fatalf("offline samples never accumulated to Duration: max window reached %d, want >= %d", maxLen, duration)
+	samples := [][]bool{{false}}
+	if maxD, passed := rule.Check(samples); maxD != duration || passed {
+		t.Fatalf("expired offline sample: maxD=%d passed=%v, want maxD=%d passed=false", maxD, passed, duration)
 	}
-	if lastPassed {
-		t.Fatalf("a server offline every tick must eventually fail the offline check (passed=false), got passed=true")
+
+	samples = append(samples, []bool{true})
+	samples = trimSamples(samples, rule.RetentionWindow())
+	if maxD, passed := rule.Check(samples); maxD != 0 || !passed {
+		t.Fatalf("healthy latest sample: maxD=%d passed=%v, want maxD=0 passed=true", maxD, passed)
 	}
 }
 
 // TestAlertRule_CombinedRuleAccumulatesSamples drives the real trim loop for
 // mixed-type alerts. The verdict is AND-of-failure: an incident fires only once
 // every rule's lookback window is full and all fail. RetentionWindow must keep
-// enough samples for the largest window (offline/general need Duration, cycle
-// needs 1); if any rule type is under-retained the alert never fires.
+// enough samples for the largest window (general needs Duration; offline,
+// cycle and ip_change need 1); if any rule type is under-retained the alert
+// never fires.
 func TestAlertRule_CombinedRuleAccumulatesSamples(t *testing.T) {
 	cases := []struct {
 		msg        string
@@ -482,7 +480,7 @@ func TestAlertRule_CombinedRuleAccumulatesSamples(t *testing.T) {
 		{"general3+general10", &AlertRule{Rules: []*Rule{{Type: "cpu", Duration: 3}, {Type: "memory", Duration: 10}}}, []bool{false, false}, 9, 10},
 		{"offline5+general10", &AlertRule{Rules: []*Rule{{Type: "offline", Duration: 5}, {Type: "cpu", Duration: 10}}}, []bool{false, false}, 9, 10},
 		{"transfer+general8", &AlertRule{Rules: []*Rule{{Type: "transfer_in_cycle"}, {Type: "cpu", Duration: 8}}}, []bool{false, false}, 7, 8},
-		{"offline3+offline12", &AlertRule{Rules: []*Rule{{Type: "offline", Duration: 3}, {Type: "offline", Duration: 12}}}, []bool{false, false}, 11, 12},
+		{"offline3+offline12", &AlertRule{Rules: []*Rule{{Type: "offline", Duration: 3}, {Type: "offline", Duration: 12}}}, []bool{false, false}, 0, 1},
 	}
 	for _, c := range cases {
 		if got := c.rule.RetentionWindow(); got != c.wantWindow {

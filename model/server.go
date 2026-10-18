@@ -73,15 +73,16 @@ type taskStreamHolder struct {
 }
 
 type serverRuntimeHolder struct {
-	mu         sync.Mutex
-	canonical  *Server
-	stream     pb.NezhaService_ReportSystemStateServer
-	generation uint64
-	state      *HostState
-	host       *Host
-	lastActive time.Time
-	prevIn     uint64
-	prevOut    uint64
+	mu           sync.Mutex
+	canonical    *Server
+	stream       pb.NezhaService_ReportSystemStateServer
+	generation   uint64
+	state        *HostState
+	host         *Host
+	lastActive   time.Time
+	lastReportAt time.Time // survives stream clear and host reboot; LastActive does not
+	prevIn       uint64
+	prevOut      uint64
 }
 
 type StateStreamLease struct {
@@ -112,7 +113,7 @@ func (s *Server) RuntimeHandle() RuntimeHandle {
 	runtimeHolderInitMu.Lock()
 	holder := s.runtime.Load()
 	if holder == nil {
-		holder = &serverRuntimeHolder{canonical: s, state: cloneHostState(s.State), host: cloneHost(s.Host), lastActive: s.LastActive, prevIn: s.PrevTransferInSnapshot, prevOut: s.PrevTransferOutSnapshot}
+		holder = &serverRuntimeHolder{canonical: s, state: cloneHostState(s.State), host: cloneHost(s.Host), lastActive: s.LastActive, lastReportAt: s.LastActive, prevIn: s.PrevTransferInSnapshot, prevOut: s.PrevTransferOutSnapshot}
 		s.runtime.Store(holder)
 	}
 	runtimeHolderInitMu.Unlock()
@@ -193,6 +194,7 @@ func (lease StateStreamLease) updateState(receiver *Server, state *HostState, la
 	canonical.LastActive = lastActive
 	lease.holder.state = cloneHostState(state)
 	lease.holder.lastActive = lastActive
+	lease.holder.lastReportAt = lastActive
 	if lease.holder.prevIn == 0 || lease.holder.prevOut == 0 {
 		lease.holder.prevIn = state.NetInTransfer
 		lease.holder.prevOut = state.NetOutTransfer
@@ -303,7 +305,7 @@ func (s *Server) AttachStateStream(stream pb.NezhaService_ReportSystemStateServe
 	defer runtimeHolderInitMu.Unlock()
 	holder := s.runtime.Load()
 	if holder == nil {
-		candidate := &serverRuntimeHolder{canonical: s, state: cloneHostState(s.State), host: cloneHost(s.Host), lastActive: s.LastActive, prevIn: s.PrevTransferInSnapshot, prevOut: s.PrevTransferOutSnapshot}
+		candidate := &serverRuntimeHolder{canonical: s, state: cloneHostState(s.State), host: cloneHost(s.Host), lastActive: s.LastActive, lastReportAt: s.LastActive, prevIn: s.PrevTransferInSnapshot, prevOut: s.PrevTransferOutSnapshot}
 		if s.runtime.CompareAndSwap(nil, candidate) {
 			holder = candidate
 		} else {
@@ -334,6 +336,7 @@ type RuntimeSnapshot struct {
 	State                   *HostState
 	Host                    *Host
 	LastActive              time.Time
+	LastReportAt            time.Time
 	PrevTransferInSnapshot  uint64
 	PrevTransferOutSnapshot uint64
 }
@@ -342,7 +345,7 @@ func (s *Server) RuntimeSnapshot() RuntimeSnapshot {
 	runtimeHolderInitMu.Lock()
 	holder := s.runtime.Load()
 	if holder == nil {
-		candidate := &serverRuntimeHolder{canonical: s, state: cloneHostState(s.State), lastActive: s.LastActive, prevIn: s.PrevTransferInSnapshot, prevOut: s.PrevTransferOutSnapshot}
+		candidate := &serverRuntimeHolder{canonical: s, state: cloneHostState(s.State), lastActive: s.LastActive, lastReportAt: s.LastActive, prevIn: s.PrevTransferInSnapshot, prevOut: s.PrevTransferOutSnapshot}
 		if s.runtime.CompareAndSwap(nil, candidate) {
 			holder = candidate
 		} else {
@@ -360,14 +363,20 @@ func (s *Server) RuntimeSnapshot() RuntimeSnapshot {
 			holder.host = cloneHost(s.Host)
 		}
 	}
-	return RuntimeSnapshot{State: cloneHostState(holder.state), Host: cloneHost(holder.host), LastActive: holder.lastActive, PrevTransferInSnapshot: holder.prevIn, PrevTransferOutSnapshot: holder.prevOut}
+	if holder.lastReportAt.IsZero() {
+		holder.lastReportAt = holder.lastActive
+		if holder.lastReportAt.IsZero() {
+			holder.lastReportAt = time.Now()
+		}
+	}
+	return RuntimeSnapshot{State: cloneHostState(holder.state), Host: cloneHost(holder.host), LastActive: holder.lastActive, LastReportAt: holder.lastReportAt, PrevTransferInSnapshot: holder.prevIn, PrevTransferOutSnapshot: holder.prevOut}
 }
 
 func (s *Server) SetTransferSnapshots(inbound, outbound uint64) bool {
 	runtimeHolderInitMu.Lock()
 	holder := s.runtime.Load()
 	if holder == nil {
-		holder = &serverRuntimeHolder{canonical: s, state: cloneHostState(s.State), lastActive: s.LastActive}
+		holder = &serverRuntimeHolder{canonical: s, state: cloneHostState(s.State), lastActive: s.LastActive, lastReportAt: s.LastActive}
 		s.runtime.Store(holder)
 	}
 	runtimeHolderInitMu.Unlock()
@@ -398,7 +407,7 @@ func (s *Server) TransferDeltaAndAdvance() (inbound, outbound uint64, deltaIn, d
 	runtimeHolderInitMu.Lock()
 	holder := s.runtime.Load()
 	if holder == nil {
-		holder = &serverRuntimeHolder{canonical: s, state: cloneHostState(s.State), host: cloneHost(s.Host), lastActive: s.LastActive, prevIn: s.PrevTransferInSnapshot, prevOut: s.PrevTransferOutSnapshot}
+		holder = &serverRuntimeHolder{canonical: s, state: cloneHostState(s.State), host: cloneHost(s.Host), lastActive: s.LastActive, lastReportAt: s.LastActive, prevIn: s.PrevTransferInSnapshot, prevOut: s.PrevTransferOutSnapshot}
 		s.runtime.Store(holder)
 	}
 	runtimeHolderInitMu.Unlock()
@@ -442,7 +451,7 @@ func (s *Server) SetHost(host *Host) bool {
 	runtimeHolderInitMu.Lock()
 	holder := s.runtime.Load()
 	if holder == nil {
-		holder = &serverRuntimeHolder{canonical: s, state: cloneHostState(s.State), lastActive: s.LastActive}
+		holder = &serverRuntimeHolder{canonical: s, state: cloneHostState(s.State), lastActive: s.LastActive, lastReportAt: s.LastActive}
 		s.runtime.Store(holder)
 	}
 	runtimeHolderInitMu.Unlock()
@@ -469,7 +478,7 @@ func InitServer(s *Server) {
 	s.State = &HostState{}
 	s.GeoIP = &GeoIP{}
 	s.ConfigCache = make(chan any, 1)
-	s.runtime.Store(&serverRuntimeHolder{canonical: s, state: cloneHostState(s.State), host: cloneHost(s.Host)})
+	s.runtime.Store(&serverRuntimeHolder{canonical: s, state: cloneHostState(s.State), host: cloneHost(s.Host), lastReportAt: time.Now()})
 }
 
 func (s *Server) CopyFromRunningServer(old *Server) {
@@ -484,7 +493,7 @@ func (s *Server) CopyFromRunningServer(old *Server) {
 	s.adoptTaskStreamHolder(old.taskStream.Load())
 	holder := old.runtime.Load()
 	if holder == nil {
-		holder = &serverRuntimeHolder{canonical: old, state: cloneHostState(old.State), host: cloneHost(old.Host), lastActive: old.LastActive, prevIn: old.PrevTransferInSnapshot, prevOut: old.PrevTransferOutSnapshot}
+		holder = &serverRuntimeHolder{canonical: old, state: cloneHostState(old.State), host: cloneHost(old.Host), lastActive: old.LastActive, lastReportAt: old.LastActive, prevIn: old.PrevTransferInSnapshot, prevOut: old.PrevTransferOutSnapshot}
 		old.runtime.CompareAndSwap(nil, holder)
 		holder = old.runtime.Load()
 	}

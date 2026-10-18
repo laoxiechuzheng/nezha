@@ -59,7 +59,9 @@ func TestServerRuntimeOwnership_oldLeaseMutatesCanonicalAfterReplacement(t *test
 	require.Equal(t, time.Unix(7, 0), snapshot.LastActive)
 	require.False(t, old.ClearStateStreamIfCurrent(lease))
 	require.True(t, newServer.ClearStateStreamIfCurrent(lease))
-	require.True(t, newServer.RuntimeSnapshot().LastActive.IsZero())
+	snapshot = newServer.RuntimeSnapshot()
+	require.True(t, snapshot.LastActive.IsZero())
+	require.Equal(t, time.Unix(7, 0), snapshot.LastReportAt)
 }
 
 func TestServerRuntimeOwnership_leaseMutatesCanonicalWithoutReceiver(t *testing.T) {
@@ -118,6 +120,7 @@ func TestServerRuntimeOwnership_copyFallbackPreservesHost(t *testing.T) {
 	require.Equal(t, "fallback", snapshot.Host.Version)
 	require.Equal(t, uint64(4), snapshot.State.Uptime)
 	require.Equal(t, time.Unix(4, 0), snapshot.LastActive)
+	require.Equal(t, time.Unix(4, 0), snapshot.LastReportAt)
 	require.Equal(t, uint64(5), snapshot.PrevTransferInSnapshot)
 	require.Equal(t, uint64(6), snapshot.PrevTransferOutSnapshot)
 }
@@ -366,4 +369,143 @@ func TestServerRuntimeOwnership_failedRestartAllowsHourlyRecordThenRetry(t *test
 	require.Equal(t, 1, records)
 	require.Equal(t, uint64(0), result.Transfer.In)
 	require.Equal(t, uint64(0), result.Transfer.Out)
+}
+
+func TestServerRuntimeOwnership_clearKeepsLastReportAt(t *testing.T) {
+	server := &Server{Common: Common{ID: 101}}
+	InitServer(server)
+	lease := server.AttachStateStream(runtimeOwnershipStream{})
+	reportAt := time.Now()
+	require.True(t, lease.UpdateState(&HostState{}, reportAt))
+
+	require.True(t, lease.Clear())
+	require.True(t, server.LastActive.IsZero(), "clear must keep the public LastActive field zero")
+
+	snapshot := server.RuntimeSnapshot()
+	require.True(t, snapshot.LastActive.IsZero())
+	require.Equal(t, reportAt, snapshot.LastReportAt, "clear must retain the private report timestamp")
+	require.True(t, (&Rule{Type: "offline", Duration: 3}).Snapshot(nil, server, nil))
+
+	expiredServer := &Server{Common: Common{ID: 105}}
+	InitServer(expiredServer)
+	expiredLease := expiredServer.AttachStateStream(runtimeOwnershipStream{})
+	expiredReportAt := time.Now().Add(-4 * time.Second)
+	require.True(t, expiredLease.UpdateState(&HostState{}, expiredReportAt))
+	require.True(t, expiredLease.Clear())
+
+	expiredSnapshot := expiredServer.RuntimeSnapshot()
+	require.True(t, expiredSnapshot.LastActive.IsZero())
+	require.Equal(t, expiredReportAt, expiredSnapshot.LastReportAt)
+	require.False(t, (&Rule{Type: "offline", Duration: 3}).Snapshot(nil, expiredServer, nil),
+		"a report older than Duration must still fail after the stream is cleared")
+}
+
+func TestServerRuntimeOwnership_holderConstructorsSeedLastReportAt(t *testing.T) {
+	reportAt := time.Now().Add(-2 * time.Second)
+
+	t.Run("attach stream", func(t *testing.T) {
+		server := &Server{Host: &Host{}, State: &HostState{}, LastActive: reportAt}
+		lease := server.AttachStateStream(runtimeOwnershipStream{})
+		require.True(t, lease.Clear())
+
+		snapshot := server.RuntimeSnapshot()
+		require.True(t, snapshot.LastActive.IsZero())
+		require.Equal(t, reportAt, snapshot.LastReportAt)
+	})
+
+	t.Run("runtime handle", func(t *testing.T) {
+		server := &Server{Host: &Host{}, State: &HostState{}, LastActive: reportAt}
+		_ = server.RuntimeHandle()
+		lease := server.AttachStateStream(runtimeOwnershipStream{})
+		require.True(t, lease.Clear())
+
+		snapshot := server.RuntimeSnapshot()
+		require.True(t, snapshot.LastActive.IsZero())
+		require.Equal(t, reportAt, snapshot.LastReportAt)
+	})
+
+	t.Run("copy fallback", func(t *testing.T) {
+		old := &Server{Host: &Host{}, State: &HostState{}, LastActive: reportAt}
+		replacement := &Server{}
+		replacement.CopyFromRunningServer(old)
+		lease := replacement.AttachStateStream(runtimeOwnershipStream{})
+		require.True(t, lease.Clear())
+
+		snapshot := replacement.RuntimeSnapshot()
+		require.True(t, snapshot.LastActive.IsZero())
+		require.Equal(t, reportAt, snapshot.LastReportAt)
+	})
+}
+
+func TestServerRuntimeOwnership_runtimeSnapshotLazilySeedsLastReportAt(t *testing.T) {
+	legacyReportAt := time.Now().Add(-2 * time.Second)
+	server := &Server{}
+	holder := &serverRuntimeHolder{canonical: server, state: &HostState{}, lastActive: legacyReportAt}
+	server.runtime.Store(holder)
+
+	snapshot := server.RuntimeSnapshot()
+	require.Equal(t, legacyReportAt, snapshot.LastReportAt)
+
+	holder.mu.Lock()
+	require.Equal(t, legacyReportAt, holder.lastReportAt)
+	holder.mu.Unlock()
+
+	empty := &Server{}
+	empty.runtime.Store(&serverRuntimeHolder{canonical: empty, state: &HostState{}})
+	before := time.Now()
+	emptySnapshot := empty.RuntimeSnapshot()
+	require.False(t, emptySnapshot.LastReportAt.IsZero())
+	require.False(t, emptySnapshot.LastReportAt.Before(before))
+
+	secondSnapshot := empty.RuntimeSnapshot()
+	require.Equal(t, emptySnapshot.LastReportAt, secondSnapshot.LastReportAt,
+		"an initialized zero-report holder must not refresh its grace timestamp")
+}
+
+func TestServerRuntimeOwnership_reconnectRejectsStaleReportTime(t *testing.T) {
+	server := &Server{Common: Common{ID: 102}}
+	InitServer(server)
+	first := server.AttachStateStream(runtimeOwnershipStream{})
+	oldReportAt := time.Now().Add(-4 * time.Second)
+	require.True(t, first.UpdateState(&HostState{}, oldReportAt))
+
+	second := server.AttachStateStream(runtimeOwnershipStream{})
+	require.False(t, first.UpdateState(&HostState{}, time.Now()))
+	require.False(t, first.Clear())
+	require.Equal(t, oldReportAt, server.RuntimeSnapshot().LastReportAt)
+
+	freshReportAt := time.Now()
+	require.True(t, second.UpdateState(&HostState{}, freshReportAt))
+	require.True(t, server.ClearStateStreamIfCurrent(second))
+	snapshot := server.RuntimeSnapshot()
+	require.True(t, snapshot.LastActive.IsZero())
+	require.Equal(t, freshReportAt, snapshot.LastReportAt)
+	require.True(t, (&Rule{Type: "offline", Duration: 3}).Snapshot(nil, server, nil))
+}
+
+func TestServerRuntimeOwnership_restartKeepsLastReportAt(t *testing.T) {
+	server := &Server{Common: Common{ID: 103}}
+	InitServer(server)
+	lease := server.AttachStateStream(runtimeOwnershipStream{})
+	reportAt := time.Now()
+	require.True(t, lease.UpdateState(&HostState{}, reportAt))
+
+	result, err := server.RuntimeHandle().ApplyHostReport(&Host{BootTime: 1}, time.Now(), nil)
+	require.NoError(t, err)
+	require.True(t, result.Restart)
+
+	snapshot := server.RuntimeSnapshot()
+	require.True(t, snapshot.LastActive.IsZero())
+	require.Equal(t, reportAt, snapshot.LastReportAt)
+}
+
+func TestServerRuntimeOwnership_initServerGivesNeverReportedGrace(t *testing.T) {
+	before := time.Now()
+	server := &Server{Common: Common{ID: 104}}
+	InitServer(server)
+
+	snapshot := server.RuntimeSnapshot()
+	require.False(t, snapshot.LastReportAt.IsZero())
+	require.False(t, snapshot.LastReportAt.Before(before))
+	require.True(t, (&Rule{Type: "offline", Duration: 3}).Snapshot(nil, server, nil))
 }

@@ -222,19 +222,21 @@ func (r *AlertRule) Check(points [][]bool) (int, bool) {
 		}
 		validRules++
 		if rule.IsOfflineRule() {
-			// 离线报警，检查直到最后一次在线的离线采样点是否大于 duration
-			if hasPassedRule = boundCheck(len(points), duration, hasPassedRule); hasPassedRule {
+			// Snapshot 已按真实秒数判定离线时长，因此这里只读取最新采样。
+			// false 表示该样本产生时已经连续离线至少 Duration 秒。
+			if hasPassedRule {
 				continue
 			}
-			var fail int
-			for _, point := range slices.Backward(points[len(points)-duration:]) {
-				fail++
-				if ruleIndex >= len(point) || point[ruleIndex] {
-					hasPassedRule = true
-					break
-				}
+			if len(points) == 0 {
+				hasPassedRule = true
+				continue
 			}
-			durations[ruleIndex] = fail
+			lastPoint := points[len(points)-1]
+			if ruleIndex >= len(lastPoint) || lastPoint[ruleIndex] {
+				hasPassedRule = true
+				continue
+			}
+			durations[ruleIndex] = duration
 			continue
 		} else {
 			// 常规报警
@@ -271,8 +273,8 @@ func (r *AlertRule) Check(points [][]bool) (int, bool) {
 // 规则定义而非 Check 的判定结果——否则窗口未填满时 Check 返回的 max=0 会被
 // 误判为"无需历史"而清空采样，使规则永远攒不够样本。
 // 各规则类型回看的采样数必须与 Check 中实际读取的窗口一致：
-//   - 周期流量规则：Check 只读最后 1 个采样点 → 需要 1
-//   - 离线规则、常规规则：Check 读取 points[len-Duration:] → 需要 Duration
+//   - 周期流量、离线、IP 变更规则：Check 只读最后 1 个采样点 → 需要 1
+//   - 常规规则：Check 读取 points[len-Duration:] → 需要 Duration
 func (r *AlertRule) RetentionWindow() int {
 	window := 0
 	for _, rule := range r.Rules {
@@ -282,6 +284,10 @@ func (r *AlertRule) RetentionWindow() int {
 		var need int
 		if rule.IsTransferDurationRule() || rule.IsIPChangeRule() {
 			need = 1
+		} else if rule.IsOfflineRule() {
+			if d, ok := rule.DurationInt(); ok && d > 0 {
+				need = 1
+			}
 		} else if d, ok := rule.DurationInt(); ok && d > 0 {
 			need = d
 		}
