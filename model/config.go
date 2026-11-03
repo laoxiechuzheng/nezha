@@ -297,6 +297,10 @@ func (c *Config) Read(path string, frontendTemplates []FrontendTemplate) error {
 		log.Printf("NEZHA>> real IP headers (web=%q agent=%q) are honoured only from trusted_proxies %v; other peers are keyed on their TCP address",
 			c.WebRealIPHeader, c.AgentRealIPHeader, c.TrustedProxyPrefixes())
 	}
+	// nginx and most proxies strip surrounding whitespace from header values,
+	// and ProxySecretMatches trims the presented value, so a stray space
+	// copied into config.yaml would otherwise make the secret never match.
+	c.TrustedProxySecret = strings.TrimSpace(c.TrustedProxySecret)
 	for _, w := range c.StartupWarnings() {
 		log.Printf("NEZHA>> WARNING: %s", w)
 	}
@@ -316,6 +320,9 @@ func (c *Config) StartupWarnings() []string {
 	}
 	if usesRealIPHeader(c.AgentRealIPHeader) && c.TrustedProxySecret == "" {
 		out = append(out, fmt.Sprintf("agent_real_ip_header %q is set but trusted_proxy_secret is empty; gRPC peers in trusted_proxies may forge their address", c.AgentRealIPHeader))
+	}
+	if n := len(c.TrustedProxySecret); n > 0 && n < minAgentSecretKeyLen {
+		out = append(out, fmt.Sprintf("trusted_proxy_secret is only %d characters; use at least %d random characters", n, minAgentSecretKeyLen))
 	}
 	if n := len(c.AgentSecretKey); n > 0 && n < minAgentSecretKeyLen {
 		out = append(out, fmt.Sprintf("agent_secret_key is only %d characters; use at least %d random characters", n, minAgentSecretKeyLen))

@@ -115,13 +115,38 @@ func TestLoginConcurrentSameIPRunsBcryptOnce(t *testing.T) {
 			t.Fatalf("unexpected status %d", c)
 		}
 	}
-	// One goroutine can in theory pass CheckIP during the first bcrypt and
-	// reach the guard only after it was released; allow that, nothing more.
-	assert.GreaterOrEqual(t, ran, 1)
-	assert.LessOrEqual(t, ran, 2, "concurrent logins from one address must not each run bcrypt")
+	// A request that passed waf.Waf during the first bcrypt but reaches the
+	// guard after it was released is stopped by the guard's own CheckIP.
+	assert.Equal(t, 1, ran, "concurrent logins from one address must not each run bcrypt")
 	assert.Equal(t, ran, ok, "only requests that ran bcrypt get a login answer")
 	assert.Equal(t, n-ran, rejected)
 	assert.Equal(t, uint64(ran), wafCount(t, "203.0.113.50"), "every executed password check counts once, rejected ones never")
+}
+
+// An address banned after it passed waf.Waf (by a login of the same key that
+// finished meanwhile) must not get another password check from the guard.
+func TestLoginGuardRechecksBanAfterEnter(t *testing.T) {
+	defer setupJWTSessionTest(t)()
+	model.SetWAFConfig(model.WAFConfig{})
+	withLoginLimiter(t, newLoginLimiter(2, time.Second))
+	calls := countBcrypt(t, 0)
+	pw, err := bcrypt.GenerateFromPassword([]byte("correct horse"), bcrypt.MinCost)
+	require.NoError(t, err)
+	require.NoError(t, singleton.DB.Model(&model.User{}).Where("id = ?", 100).Update("password", string(pw)).Error)
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	// RealIp and Waf pass, then the ban lands before the guard runs.
+	r.Use(waf.RealIp, waf.Waf, func(c *gin.Context) {
+		require.NoError(t, model.BlockIP(singleton.DB, c.GetString(model.CtxKeyRealIPStr), model.WAFBlockReasonTypeLoginFail, model.BlockIDUnknownUser))
+	})
+	r.POST("/api/v1/login", loginGuard(), func(c *gin.Context) {
+		_, _ = authenticator()(c)
+		c.Status(http.StatusOK)
+	})
+
+	assert.Equal(t, http.StatusForbidden, loginAs(r, "203.0.113.80:1", "victim", "correct horse"))
+	assert.Equal(t, int32(0), calls.Load())
 }
 
 // The global bcrypt slots are shared by all addresses; when they stay busy

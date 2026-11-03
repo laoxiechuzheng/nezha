@@ -8,7 +8,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/nezhahq/nezha/cmd/dashboard/controller/waf"
 	"github.com/nezhahq/nezha/model"
+	"github.com/nezhahq/nezha/service/singleton"
 )
 
 // loginLimiter bounds the bcrypt work an unauthenticated client can cause.
@@ -61,12 +63,20 @@ func (l *loginLimiter) leave(key string) {
 }
 
 func (l *loginLimiter) handle(c *gin.Context) {
-	key := model.WAFKey(c.GetString(model.CtxKeyRealIPStr))
+	ip := c.GetString(model.CtxKeyRealIPStr)
+	key := model.WAFKey(ip)
 	if !l.enter(key) {
 		abortTooManyLogins(c)
 		return
 	}
 	defer l.leave(key)
+
+	// waf.Waf checked the address before this request queued here; a login
+	// from the same key that finished in between may have banned it since.
+	if err := model.CheckIP(singleton.DB, ip, model.WAFScopeWeb); err != nil {
+		waf.ShowBlockPage(c, err)
+		return
+	}
 
 	timer := time.NewTimer(l.wait)
 	defer timer.Stop()

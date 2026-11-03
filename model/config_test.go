@@ -283,7 +283,7 @@ agent_secret_key: abcdefghijklmnopqrstuvwxyz012345
 trusted_proxies:
   - 172.24.0.1/32
   - 127.0.0.1
-trusted_proxy_secret: s3cr3t-value
+trusted_proxy_secret: "  s3cr3t-value-0123456789abcdef0123  "
 trusted_proxy_secret_header: X-Edge-Auth
 jwt_ip_binding: exact
 waf:
@@ -307,7 +307,7 @@ waf:
 	if got := c.TrustedProxyPrefixes(); len(got) != 2 || got[0].String() != "172.24.0.1/32" || got[1].String() != "127.0.0.1/32" {
 		t.Fatalf("parsed trusted proxies = %v", got)
 	}
-	if c.TrustedProxySecret != "s3cr3t-value" || c.ProxySecretHeaderName() != "X-Edge-Auth" {
+	if c.TrustedProxySecret != "s3cr3t-value-0123456789abcdef0123" || c.ProxySecretHeaderName() != "X-Edge-Auth" {
 		t.Fatalf("secret/header = %q/%q", c.TrustedProxySecret, c.ProxySecretHeaderName())
 	}
 	if c.SessionIPBinding() != JWTIPBindingExact {
@@ -379,6 +379,12 @@ func TestConfigStartupWarnings(t *testing.T) {
 
 	c.TrustedProxySecret = "do-not-print-me"
 	c.AgentSecretKey = strings.Repeat("a", 32)
+	ws = strings.Join(c.StartupWarnings(), "\n")
+	if !strings.Contains(ws, "trusted_proxy_secret is only 15 characters") || strings.Contains(ws, "do-not-print-me") {
+		t.Fatalf("want short proxy secret warning without the value: %s", ws)
+	}
+
+	c.TrustedProxySecret = "do-not-print-me-" + strings.Repeat("x", 16)
 	if ws := c.StartupWarnings(); len(ws) != 0 {
 		t.Fatalf("unexpected warnings: %v", ws)
 	}
