@@ -367,3 +367,18 @@ func TestClientIPRequiresProxySecret(t *testing.T) {
 	got, _ := waf.ClientIP(req)
 	assert.Equal(t, "203.0.113.9", got)
 }
+
+// The access log must show the WAF client IP, never a client-written header.
+func TestAccessLogUsesWAFClientIP(t *testing.T) {
+	line := accessLogFormatter(gin.LogFormatterParams{
+		ClientIP: "1.2.3.4", // what gin derives from a forged X-Forwarded-For
+		Keys:     map[any]any{model.CtxKeyRealIPStr: "203.0.113.9"},
+		Method:   http.MethodPost,
+		Path:     "/api/v1/login",
+	})
+	assert.Contains(t, line, "203.0.113.9")
+	assert.NotContains(t, line, "1.2.3.4")
+
+	line = accessLogFormatter(gin.LogFormatterParams{ClientIP: "198.51.100.7", Path: "/"})
+	assert.Contains(t, line, "198.51.100.7")
+}

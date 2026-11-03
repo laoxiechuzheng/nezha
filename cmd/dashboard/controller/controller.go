@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	jwt "github.com/appleboy/gin-jwt/v2"
 	"github.com/gin-contrib/pprof"
@@ -27,7 +28,12 @@ import (
 
 func ServeWeb(frontendDist fs.FS) http.Handler {
 	gin.SetMode(gin.ReleaseMode)
-	r := gin.Default()
+	r := gin.New()
+	// gin's ClientIP trusts X-Forwarded-For/X-Real-IP from any peer by
+	// default, so its access log showed whatever address a client wrote.
+	// Log the address waf.RealIp resolved instead and trust no headers.
+	_ = r.SetTrustedProxies(nil)
+	r.Use(gin.LoggerWithFormatter(accessLogFormatter), gin.Recovery())
 
 	if singleton.Conf.Debug {
 		gin.SetMode(gin.DebugMode)
@@ -47,6 +53,26 @@ func ServeWeb(frontendDist fs.FS) http.Handler {
 	kickoffTransferGC()
 
 	return r
+}
+
+// accessLogFormatter is gin's default log line, keyed on the client IP that
+// waf.RealIp resolved (falling back to the TCP peer when it did not run).
+func accessLogFormatter(p gin.LogFormatterParams) string {
+	if ip, _ := p.Keys[model.CtxKeyRealIPStr].(string); ip != "" {
+		p.ClientIP = ip
+	}
+	if p.Latency > time.Minute {
+		p.Latency = p.Latency.Truncate(time.Second)
+	}
+	return fmt.Sprintf("[GIN] %v | %3d | %13v | %15s | %-7s %#v\n%s",
+		p.TimeStamp.Format("2006/01/02 - 15:04:05"),
+		p.StatusCode,
+		p.Latency,
+		p.ClientIP,
+		p.Method,
+		p.Path,
+		p.ErrorMessage,
+	)
 }
 
 func routers(r *gin.Engine, frontendDist fs.FS) {
