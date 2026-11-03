@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -47,6 +48,12 @@ func (a *authHandler) check(ctx context.Context) (uint64, error) {
 
 	ip, _ := ctx.Value(model.CtxKeyRealIP{}).(string)
 
+	if model.CurrentWAFConfig().GRPCStrictBlock {
+		if err := model.CheckIP(singleton.DB, ip, model.WAFScopeGRPC); err != nil {
+			return 0, wafStatus(err)
+		}
+	}
+
 	clientUUID := firstMetadataValue(md, "client-uuid", "client_uuid")
 
 	if _, err := uuid.ParseUUID(clientUUID); err != nil {
@@ -55,8 +62,7 @@ func (a *authHandler) check(ctx context.Context) (uint64, error) {
 		// with a malformed/missing UUID otherwise bypasses
 		// WAFBlockReasonTypeAgentAuthFail entirely and gets unbounded
 		// retries (TestAuthBadSecret*InvalidUUIDStillIncrementsAgentAuthFailWAF).
-		model.BlockIP(singleton.DB, ip, model.WAFBlockReasonTypeAgentAuthFail, model.BlockIDgRPC)
-		return 0, status.Error(codes.Unauthenticated, "客户端 UUID 不合法")
+		return 0, agentAuthFailed(ip, status.Error(codes.Unauthenticated, "客户端 UUID 不合法"))
 	}
 
 	// Per-transfer handshake secret path: ApplyConfig delivers a random
@@ -149,8 +155,7 @@ func (a *authHandler) check(ctx context.Context) (uint64, error) {
 	userId, ok := singleton.AgentSecretToUserId[clientSecret]
 	if !ok {
 		singleton.UserLock.RUnlock()
-		model.BlockIP(singleton.DB, ip, model.WAFBlockReasonTypeAgentAuthFail, model.BlockIDgRPC)
-		return 0, status.Error(codes.Unauthenticated, "客户端认证失败")
+		return 0, agentAuthFailed(ip, status.Error(codes.Unauthenticated, "客户端认证失败"))
 	}
 	singleton.UserLock.RUnlock()
 
@@ -175,6 +180,26 @@ func (a *authHandler) check(ctx context.Context) (uint64, error) {
 	}
 
 	return clientID, nil
+}
+
+// agentAuthFailed applies the gRPC-scope WAF to a failed credential check:
+// an address that is already banned gets the ban back (and is not counted
+// again, mirroring the web WAF which rejects before the handler runs);
+// otherwise the failure is counted. Only gRPC auth failures feed this scope,
+// so web login failures from a shared egress IP never cut off its agents.
+func agentAuthFailed(ip string, authErr error) error {
+	if err := model.CheckIP(singleton.DB, ip, model.WAFScopeGRPC); err != nil {
+		return wafStatus(err)
+	}
+	model.BlockIP(singleton.DB, ip, model.WAFBlockReasonTypeAgentAuthFail, model.BlockIDgRPC)
+	return authErr
+}
+
+func wafStatus(err error) error {
+	if errors.Is(err, model.ErrWAFBlocked) {
+		return status.Error(codes.PermissionDenied, err.Error())
+	}
+	return status.Error(codes.Unavailable, err.Error())
 }
 
 func firstMetadataValue(md metadata.MD, keys ...string) string {

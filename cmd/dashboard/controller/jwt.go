@@ -12,7 +12,6 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 
-	"github.com/nezhahq/nezha/cmd/dashboard/controller/waf"
 	"github.com/nezhahq/nezha/model"
 	"github.com/nezhahq/nezha/pkg/idcodec"
 	"github.com/nezhahq/nezha/pkg/utils"
@@ -292,15 +291,17 @@ func fallbackAuthMiddleware(mw *jwt.GinJWTMiddleware) func(c *gin.Context) {
 		c.Set("JWT_PAYLOAD", claims)
 		identity := mw.IdentityHandler(c)
 
+		// A nil identity here means a token we signed ourselves no longer maps
+		// to a live session (logged out, expired, password changed, IP
+		// changed). That is not brute force — forging needs the HS256 key —
+		// so it just continues as a guest. The two forgery-shaped cases
+		// (undecodable uid, uid/session mismatch) are already counted inside
+		// identityHandler. Counting stale sessions here used to ban owners
+		// whose open tabs kept polling with an old cookie once the WAF
+		// always sees a client IP.
 		if identity != nil {
 			model.UnblockIP(singleton.DB, realIP, model.BlockIDToken)
 			c.Set(mw.IdentityKey, identity)
-		} else {
-			isIpMismatch := c.GetBool(model.CtxKeyIsIPMismatch)
-			if !isIpMismatch {
-				waf.ShowBlockPage(c, model.BlockIP(singleton.DB, realIP, model.WAFBlockReasonTypeBruteForceToken, model.BlockIDToken))
-				return
-			}
 		}
 
 		c.Next()

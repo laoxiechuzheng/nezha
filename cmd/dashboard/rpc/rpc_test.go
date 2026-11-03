@@ -5,6 +5,7 @@ import (
 	"net"
 	"testing"
 
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 
 	"github.com/nezhahq/nezha/model"
@@ -81,13 +82,10 @@ func TestCtxWithRealIP_PeerIPModeNoPeer(t *testing.T) {
 	}
 }
 
-// TestCtxWithRealIP_NoHeaderLeavesRealIPUnset pins the intended behaviour when
-// no real-IP header is configured: this is an explicit "no IP-based WAF" stance,
-// so ctxWithRealIP must not error and must leave CtxKeyRealIP unset (CheckIP
-// then no-ops on empty IP). CtxKeyConnectingIP is still populated for the
-// nezha.go fallback. Guards against accidentally coupling the no-header path to
-// the peer-IP fix.
-func TestCtxWithRealIP_NoHeaderLeavesRealIPUnset(t *testing.T) {
+// TestCtxWithRealIP_NoHeaderUsesPeer pins the always-on WAF: with no real-IP
+// header configured the WAF must still key on the TCP peer instead of
+// silently skipping (an empty CtxKeyRealIP made CheckIP/BlockIP no-ops).
+func TestCtxWithRealIP_NoHeaderUsesPeer(t *testing.T) {
 	withRealIPHeader(t, "")
 
 	ctx, err := ctxWithRealIP(peerCtx("203.0.113.7:54321"))
@@ -95,12 +93,71 @@ func TestCtxWithRealIP_NoHeaderLeavesRealIPUnset(t *testing.T) {
 		t.Fatalf("no-header mode must not error, got %v", err)
 	}
 
-	if v := ctx.Value(model.CtxKeyRealIP{}); v != nil {
-		t.Fatalf("CtxKeyRealIP must be unset when no real-IP header is configured, got %v", v)
+	realIP, _ := ctx.Value(model.CtxKeyRealIP{}).(string)
+	if realIP != "203.0.113.7" {
+		t.Fatalf("CtxKeyRealIP = %q, want the peer 203.0.113.7", realIP)
 	}
 
 	connIP, _ := ctx.Value(model.CtxKeyConnectingIP{}).(string)
 	if connIP != "203.0.113.7" {
 		t.Fatalf("CtxKeyConnectingIP = %q, want %q", connIP, "203.0.113.7")
+	}
+}
+
+func withTrustedProxies(t *testing.T, header string, proxies ...string) {
+	t.Helper()
+	conf := &model.Config{}
+	conf.AgentRealIPHeader = header
+	if err := conf.SetTrustedProxies(proxies); err != nil {
+		t.Fatalf("trusted proxies: %v", err)
+	}
+	orig := singleton.Conf
+	singleton.Conf = &singleton.ConfigClass{Config: conf}
+	t.Cleanup(func() { singleton.Conf = orig })
+}
+
+func headerPeerCtx(addr, header, value string) context.Context {
+	return metadata.NewIncomingContext(peerCtx(addr), metadata.Pairs(header, value))
+}
+
+// An agent connecting directly cannot choose the address it is banned under.
+func TestCtxWithRealIP_HeaderFromUntrustedPeerIgnored(t *testing.T) {
+	withRealIPHeader(t, "x-real-ip")
+
+	ctx, err := ctxWithRealIP(headerPeerCtx("203.0.113.7:54321", "x-real-ip", "198.51.100.1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if realIP, _ := ctx.Value(model.CtxKeyRealIP{}).(string); realIP != "203.0.113.7" {
+		t.Fatalf("CtxKeyRealIP = %q, want peer 203.0.113.7 (header from untrusted peer must be ignored)", realIP)
+	}
+}
+
+// Header missing from a trusted proxy falls back to the peer instead of
+// rejecting the RPC (the old behaviour returned "real ip header not found").
+func TestCtxWithRealIP_TrustedPeerMissingHeaderFallsBack(t *testing.T) {
+	withRealIPHeader(t, "x-real-ip")
+
+	ctx, err := ctxWithRealIP(peerCtx("127.0.0.1:40000"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if realIP, _ := ctx.Value(model.CtxKeyRealIP{}).(string); realIP != "127.0.0.1" {
+		t.Fatalf("CtxKeyRealIP = %q, want 127.0.0.1", realIP)
+	}
+}
+
+func TestCtxWithRealIP_HeaderFromTrustedProxyHonoured(t *testing.T) {
+	withTrustedProxies(t, "x-real-ip", "172.24.0.1/32")
+
+	ctx, err := ctxWithRealIP(headerPeerCtx("172.24.0.1:40000", "x-real-ip", "198.51.100.1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if realIP, _ := ctx.Value(model.CtxKeyRealIP{}).(string); realIP != "198.51.100.1" {
+		t.Fatalf("CtxKeyRealIP = %q, want 198.51.100.1", realIP)
+	}
+	if connIP, _ := ctx.Value(model.CtxKeyConnectingIP{}).(string); connIP != "172.24.0.1" {
+		t.Fatalf("CtxKeyConnectingIP = %q, want 172.24.0.1", connIP)
 	}
 }

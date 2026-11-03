@@ -26,13 +26,15 @@ func SetMCPKillSwitchObserver(fn func() bool) {
 }
 
 func ServeRPC() *grpc.Server {
-	// Streaming RPCs (RequestTask, IOStream) need the same real-IP + WAF
-	// gate as unary calls; without the stream interceptors authHandler.check
-	// sees an empty real IP, so brute-force BlockIP counters never key on a
-	// source and the WAF block table is bypassed at the stream entrypoint.
+	// Streaming RPCs (RequestTask, IOStream) need the same real-IP resolution
+	// as unary calls; without the stream interceptor authHandler.check sees
+	// an empty real IP and brute-force BlockIP counters never key on a source.
+	// The WAF gate lives in authHandler.check (every RPC authenticates first)
+	// so it only consults gRPC-scope bans and, unless waf.grpc_strict_block is
+	// set, never rejects an agent presenting valid credentials.
 	server := grpc.NewServer(
-		grpc.ChainUnaryInterceptor(getRealIp, waf),
-		grpc.ChainStreamInterceptor(getRealIpStream, wafStream),
+		grpc.ChainUnaryInterceptor(getRealIp),
+		grpc.ChainStreamInterceptor(getRealIpStream),
 	)
 	rpcService.NezhaHandlerSingleton = rpcService.NewNezhaHandler()
 	// Install the IOStream revocation hook so ServerTransferShared can tear

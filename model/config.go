@@ -1,7 +1,9 @@
 package model
 
 import (
+	"fmt"
 	"log"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -94,6 +96,18 @@ type Config struct {
 	JWTSecretKeyLastRotatedVersion string `koanf:"jwt_secret_key_last_rotated_version" json:"jwt_secret_key_last_rotated_version,omitempty"`
 	ListenPort                     uint16 `koanf:"listen_port" json:"listen_port,omitempty"`
 	ListenHost                     string `koanf:"listen_host" json:"listen_host,omitempty"`
+
+	// TrustedProxies lists the peers (CIDR or bare IP) allowed to supply
+	// web_real_ip_header / agent_real_ip_header. Requests from any other
+	// peer are keyed on the TCP peer address and the header is ignored.
+	// Empty = loopback only (127.0.0.0/8, ::1/128). A reverse proxy on the
+	// docker host reaches the container from the bridge gateway (for example
+	// 172.24.0.1/32), which must be listed here explicitly.
+	TrustedProxies []string `koanf:"trusted_proxies" json:"trusted_proxies,omitempty"`
+	// WAF tunes brute-force bans; see model.WAFConfig.
+	WAF WAFConfig `koanf:"waf" json:"waf"`
+
+	trustedProxies []netip.Prefix `koanf:"-" json:"-" yaml:"-"`
 
 	jwtSecretFromEnv  bool `koanf:"-" json:"-" yaml:"-"`
 	jwtSecretFromYAML bool `koanf:"-" json:"-" yaml:"-"`
@@ -237,7 +251,36 @@ func (c *Config) Read(path string, frontendTemplates []FrontendTemplate) error {
 
 	c.mcpEnabled.Store(c.EnableMCP)
 
+	if err := c.SetTrustedProxies(c.TrustedProxies); err != nil {
+		return err
+	}
+	SetWAFConfig(c.WAF)
+	if c.WebRealIPHeader != "" || c.AgentRealIPHeader != "" {
+		log.Printf("NEZHA>> real IP headers (web=%q agent=%q) are honoured only from trusted_proxies %v; other peers are keyed on their TCP address",
+			c.WebRealIPHeader, c.AgentRealIPHeader, c.TrustedProxyPrefixes())
+	}
+
 	return nil
+}
+
+// SetTrustedProxies validates and installs trusted_proxies.
+func (c *Config) SetTrustedProxies(entries []string) error {
+	parsed, err := utils.ParseTrustedProxies(entries)
+	if err != nil {
+		return fmt.Errorf("trusted_proxies: %w", err)
+	}
+	c.TrustedProxies = entries
+	c.trustedProxies = parsed
+	return nil
+}
+
+// TrustedProxyPrefixes returns the parsed trusted_proxies, or the loopback
+// default when none are configured.
+func (c *Config) TrustedProxyPrefixes() []netip.Prefix {
+	if len(c.trustedProxies) == 0 {
+		return utils.DefaultTrustedProxies
+	}
+	return c.trustedProxies
 }
 
 // MCPEnabled 并发安全地读取 MCP kill switch 状态。

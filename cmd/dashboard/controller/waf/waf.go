@@ -15,34 +15,40 @@ import (
 //go:embed waf.html
 var errorPageTemplate string
 
+// ClientIP resolves the address WAF accounting and session binding key on:
+// the TCP peer, or web_real_ip_header when the peer is a trusted proxy.
+func ClientIP(r *http.Request) (string, bool) {
+	header := singleton.Conf.WebRealIPHeader
+	if header == model.ConfigUsePeerIP {
+		header = ""
+	}
+	var vals []string
+	if header != "" {
+		vals = r.Header.Values(header)
+	}
+	peer, _ := utils.ParseRemoteAddr(r.RemoteAddr)
+	ip, ok := utils.ResolveClientIP(peer, header, vals, singleton.Conf.TrustedProxyPrefixes())
+	if !ok {
+		return "", false
+	}
+	return ip.String(), true
+}
+
+// RealIp always populates CtxKeyRealIPStr so the WAF can never be skipped.
 func RealIp(c *gin.Context) {
-	if singleton.Conf.WebRealIPHeader == "" {
-		c.Next()
-		return
-	}
-
-	if singleton.Conf.WebRealIPHeader == model.ConfigUsePeerIP {
-		c.Set(model.CtxKeyRealIPStr, c.RemoteIP())
-		c.Next()
-		return
-	}
-
-	vals := c.Request.Header.Get(singleton.Conf.WebRealIPHeader)
-	if vals == "" {
-		c.AbortWithStatusJSON(http.StatusOK, model.CommonResponse[any]{Success: false, Error: "real ip header not found"})
-		return
-	}
-	ip, err := utils.GetIPFromHeader(vals)
-	if err != nil {
-		c.AbortWithStatusJSON(http.StatusOK, model.CommonResponse[any]{Success: false, Error: err.Error()})
+	ip, ok := ClientIP(c.Request)
+	if !ok {
+		c.AbortWithStatusJSON(http.StatusBadRequest, model.CommonResponse[any]{Success: false, Error: "cannot determine client ip"})
 		return
 	}
 	c.Set(model.CtxKeyRealIPStr, ip)
 	c.Next()
 }
 
+// Waf runs before every handler, so a banned address never reaches bcrypt
+// in the login handler.
 func Waf(c *gin.Context) {
-	if err := model.CheckIP(singleton.DB, c.GetString(model.CtxKeyRealIPStr)); err != nil {
+	if err := model.CheckIP(singleton.DB, c.GetString(model.CtxKeyRealIPStr), model.WAFScopeWeb); err != nil {
 		ShowBlockPage(c, err)
 		return
 	}

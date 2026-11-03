@@ -3,7 +3,6 @@ package utils
 import (
 	"cmp"
 	"crypto/rand"
-	"errors"
 	"fmt"
 	"iter"
 	"maps"
@@ -12,7 +11,6 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
-	"strings"
 
 	"golang.org/x/exp/constraints"
 )
@@ -56,19 +54,6 @@ func BinaryToIPString(b []byte) string {
 
 	addr := netip.AddrFrom16([16]byte(b))
 	return addr.Unmap().String()
-}
-
-func GetIPFromHeader(headerValue string) (string, error) {
-	a := strings.Split(headerValue, ",")
-	h := strings.TrimSpace(a[len(a)-1])
-	ip, err := netip.ParseAddr(h)
-	if err != nil {
-		return "", err
-	}
-	if !ip.IsValid() {
-		return "", errors.New("invalid ip")
-	}
-	return ip.String(), nil
 }
 
 func GenerateRandomString(n int) (string, error) {
