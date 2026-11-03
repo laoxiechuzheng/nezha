@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"net/netip"
+	"sync"
 	"time"
 
 	jwt "github.com/appleboy/gin-jwt/v2"
@@ -23,6 +25,38 @@ const (
 	jwtClaimKeyID  = "keyId"
 	jwtKeyIDBytes  = 32
 )
+
+// compareHashAndPassword is bcrypt.CompareHashAndPassword; tests wrap it to
+// count how often the expensive comparison really runs.
+var compareHashAndPassword = bcrypt.CompareHashAndPassword
+
+// dummyPasswordHash is compared against when the username does not exist (or
+// cannot log in with a password) so those failures cost about as much time as
+// a wrong password and do not reveal which usernames are real.
+var dummyPasswordHash = sync.OnceValue(func() []byte {
+	h, err := bcrypt.GenerateFromPassword([]byte("nezha-login-timing-equaliser"), bcrypt.DefaultCost)
+	if err != nil {
+		panic(err)
+	}
+	return h
+})
+
+// sessionIPMatches applies jwt_ip_binding to the IP a session was issued to
+// and the IP presenting it now.
+func sessionIPMatches(stored, current, mode string) bool {
+	if mode == model.JWTIPBindingOff {
+		return true
+	}
+	a, errA := netip.ParseAddr(stored)
+	b, errB := netip.ParseAddr(current)
+	if errA != nil || errB != nil {
+		return stored == current
+	}
+	if mode == model.JWTIPBindingExact {
+		return a.Unmap() == b.Unmap()
+	}
+	return utils.MaskAddr(a, 24, 64) == utils.MaskAddr(b, 24, 64)
+}
 
 func uaHash(c *gin.Context) string {
 	sum := sha256.Sum256([]byte(c.Request.UserAgent()))
@@ -151,7 +185,26 @@ func identityHandler() func(c *gin.Context) any {
 			return nil
 		}
 		currentIP := c.GetString(model.CtxKeyRealIPStr)
-		if sess.IP != currentIP {
+		if sess.IP == "" && currentIP != "" {
+			// Sessions issued before the client IP was always resolved
+			// stored "" (the old RealIp left it empty without a real-IP
+			// header) and therefore were never IP bound. Bind them to the
+			// first IP that presents them instead of logging every owner
+			// out on upgrade; afterwards they are checked like new ones.
+			res := singleton.DB.Model(&model.JWTSession{}).
+				Where("key_id = ? AND ip = ?", keyID, "").
+				Update("ip", currentIP)
+			if res.Error != nil {
+				return nil
+			}
+			if res.RowsAffected == 1 {
+				sess.IP = currentIP
+			} else if err := singleton.DB.Model(&model.JWTSession{}).
+				Select("ip").Where("key_id = ?", keyID).Scan(&sess.IP).Error; err != nil {
+				return nil
+			}
+		}
+		if !sessionIPMatches(sess.IP, currentIP, singleton.Conf.SessionIPBinding()) {
 			c.Set(model.CtxKeyIsIPMismatch, true)
 			return nil
 		}
@@ -194,17 +247,19 @@ func authenticator() func(c *gin.Context) (any, error) {
 
 		if err := singleton.DB.Select("id", "password", "reject_password", "token_version").Where("username = ?", loginVals.Username).First(&user).Error; err != nil {
 			if err == gorm.ErrRecordNotFound {
+				_ = compareHashAndPassword(dummyPasswordHash(), []byte(loginVals.Password))
 				model.BlockIP(singleton.DB, realip, model.WAFBlockReasonTypeLoginFail, model.BlockIDUnknownUser)
 			}
 			return nil, jwt.ErrFailedAuthentication
 		}
 
 		if user.RejectPassword {
+			_ = compareHashAndPassword(dummyPasswordHash(), []byte(loginVals.Password))
 			model.BlockIP(singleton.DB, realip, model.WAFBlockReasonTypeLoginFail, int64(user.ID))
 			return nil, jwt.ErrFailedAuthentication
 		}
 
-		if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(loginVals.Password)); err != nil {
+		if err := compareHashAndPassword([]byte(user.Password), []byte(loginVals.Password)); err != nil {
 			model.BlockIP(singleton.DB, realip, model.WAFBlockReasonTypeLoginFail, int64(user.ID))
 			return nil, jwt.ErrFailedAuthentication
 		}

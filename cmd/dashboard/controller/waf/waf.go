@@ -16,10 +16,14 @@ import (
 var errorPageTemplate string
 
 // ClientIP resolves the address WAF accounting and session binding key on:
-// the TCP peer, or web_real_ip_header when the peer is a trusted proxy.
+// the TCP peer, or web_real_ip_header when the peer is a trusted proxy that
+// (if trusted_proxy_secret is set) also presented the proxy secret.
 func ClientIP(r *http.Request) (string, bool) {
 	header := singleton.Conf.WebRealIPHeader
 	if header == model.ConfigUsePeerIP {
+		header = ""
+	}
+	if header != "" && !singleton.Conf.ProxyAuthenticated(r.Header.Values(singleton.Conf.ProxySecretHeaderName())) {
 		header = ""
 	}
 	var vals []string

@@ -234,20 +234,18 @@ func apiTokenAuthMiddleware() gin.HandlerFunc {
 			abortAPITokenUnauthorized(c, "api token lookup failed")
 			return
 		}
+		// Only an unknown token is guessing. An expired token or one whose
+		// owner was deleted is a real credential that went stale (a forgotten
+		// cron job, an old MCP client); counting it would ban the owner's own
+		// address, so it is a plain 401.
 		now := time.Now()
 		if tok.IsExpired(now) {
-			if !readOnly {
-				model.BlockIP(singleton.DB, realIP, model.WAFBlockReasonTypeBruteForceToken, model.BlockIDToken)
-			}
 			abortAPITokenUnauthorized(c, "api token expired")
 			return
 		}
 
 		var user model.User
 		if err := singleton.DB.First(&user, tok.UserID).Error; err != nil {
-			if !readOnly {
-				model.BlockIP(singleton.DB, realIP, model.WAFBlockReasonTypeBruteForceToken, model.BlockIDToken)
-			}
 			abortAPITokenUnauthorized(c, "owner of api token not found")
 			return
 		}

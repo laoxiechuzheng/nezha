@@ -31,6 +31,23 @@ const (
 	JWTSecretKeyRotationBaselineVersion = "v2.0.13"
 )
 
+// DefaultTrustedProxySecretHeader carries trusted_proxy_secret from the
+// reverse proxy when trusted_proxy_secret_header is not set.
+const DefaultTrustedProxySecretHeader = "X-Nezha-Proxy-Auth"
+
+// jwt_ip_binding values.
+const (
+	JWTIPBindingPrefix = "prefix" // default: IPv4 /24, IPv6 /64
+	JWTIPBindingExact  = "exact"
+	JWTIPBindingOff    = "off"
+)
+
+// minAgentSecretKeyLen is the length of a generated agent_secret_key; shorter
+// operator supplied keys are accepted but warned about, because a banned
+// address may still authenticate with a valid agent secret (see
+// WAFConfig.GRPCStrictBlock) and the key alone has to resist guessing.
+const minAgentSecretKeyLen = 32
+
 const (
 	ConfigCoverAll = iota + 1
 	ConfigCoverIgnoreAll
@@ -104,6 +121,19 @@ type Config struct {
 	// docker host reaches the container from the bridge gateway (for example
 	// 172.24.0.1/32), which must be listed here explicitly.
 	TrustedProxies []string `koanf:"trusted_proxies" json:"trusted_proxies,omitempty"`
+	// TrustedProxySecret, when set, must also be presented by the trusted
+	// proxy in TrustedProxySecretHeader before the real-IP header is honoured.
+	// It closes the docker-proxy / hairpin path where an Internet client
+	// reaches the published port but appears to come from the bridge gateway.
+	// Never returned by the settings API (it lives outside ConfigDashboard).
+	TrustedProxySecret string `koanf:"trusted_proxy_secret" json:"trusted_proxy_secret,omitempty"`
+	// TrustedProxySecretHeader names the header carrying TrustedProxySecret
+	// (default X-Nezha-Proxy-Auth). gRPC metadata uses the same name.
+	TrustedProxySecretHeader string `koanf:"trusted_proxy_secret_header" json:"trusted_proxy_secret_header,omitempty"`
+	// JWTIPBinding: how strictly a web session is tied to the client IP it
+	// was issued to: prefix (default; IPv4 /24, IPv6 /64), exact or off.
+	// Read it through SessionIPBinding().
+	JWTIPBinding string `koanf:"jwt_ip_binding" json:"jwt_ip_binding,omitempty"`
 	// WAF tunes brute-force bans; see model.WAFConfig.
 	WAF WAFConfig `koanf:"waf" json:"waf"`
 
@@ -254,13 +284,85 @@ func (c *Config) Read(path string, frontendTemplates []FrontendTemplate) error {
 	if err := c.SetTrustedProxies(c.TrustedProxies); err != nil {
 		return err
 	}
+	switch c.JWTIPBinding {
+	case "", JWTIPBindingPrefix, JWTIPBindingExact, JWTIPBindingOff:
+	default:
+		return fmt.Errorf("jwt_ip_binding: %q is not one of prefix, exact, off", c.JWTIPBinding)
+	}
+	if c.WAF.IPv6Prefix < 0 || c.WAF.IPv6Prefix > 128 {
+		return fmt.Errorf("waf.ipv6_prefix: %d is outside 0..128 (0 = default 64)", c.WAF.IPv6Prefix)
+	}
 	SetWAFConfig(c.WAF)
 	if c.WebRealIPHeader != "" || c.AgentRealIPHeader != "" {
 		log.Printf("NEZHA>> real IP headers (web=%q agent=%q) are honoured only from trusted_proxies %v; other peers are keyed on their TCP address",
 			c.WebRealIPHeader, c.AgentRealIPHeader, c.TrustedProxyPrefixes())
 	}
+	for _, w := range c.StartupWarnings() {
+		log.Printf("NEZHA>> WARNING: %s", w)
+	}
 
 	return nil
+}
+
+// StartupWarnings lists risky but accepted settings. It never includes
+// secret values.
+func (c *Config) StartupWarnings() []string {
+	var out []string
+	if usesRealIPHeader(c.WebRealIPHeader) && c.TrustedProxySecret == "" {
+		out = append(out, fmt.Sprintf("web_real_ip_header %q is set but trusted_proxy_secret is empty: any connection whose peer is in trusted_proxies %v may set the header. "+
+			"When the dashboard runs in docker with a published port, Internet clients hairpinned through docker-proxy/NAT and other containers on the host also arrive from the bridge gateway, "+
+			"so they can forge their address to dodge or redirect WAF bans. Set trusted_proxy_secret and have the reverse proxy send it in %s.",
+			c.WebRealIPHeader, c.TrustedProxyPrefixes(), c.ProxySecretHeaderName()))
+	}
+	if usesRealIPHeader(c.AgentRealIPHeader) && c.TrustedProxySecret == "" {
+		out = append(out, fmt.Sprintf("agent_real_ip_header %q is set but trusted_proxy_secret is empty; gRPC peers in trusted_proxies may forge their address", c.AgentRealIPHeader))
+	}
+	if n := len(c.AgentSecretKey); n > 0 && n < minAgentSecretKeyLen {
+		out = append(out, fmt.Sprintf("agent_secret_key is only %d characters; use at least %d random characters", n, minAgentSecretKeyLen))
+	}
+	return out
+}
+
+// RealIPHeaderWarning returns a warning when a real-IP header is switched on
+// while trusted_proxies is empty (loopback only), which almost always means
+// the header will be ignored behind a dockerised or remote proxy. Empty when
+// there is nothing to warn about.
+func (c *Config) RealIPHeaderWarning(name, prev, next string) string {
+	if next == prev || !usesRealIPHeader(next) || len(c.TrustedProxies) > 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s set to %q but trusted_proxies is empty: the header is only honoured from loopback (127.0.0.0/8, ::1). "+
+		"Add the proxy address (for example the docker bridge gateway) to trusted_proxies in config.yaml and set trusted_proxy_secret.", name, next)
+}
+
+func usesRealIPHeader(h string) bool {
+	return h != "" && h != ConfigUsePeerIP
+}
+
+// ProxySecretHeaderName is trusted_proxy_secret_header or its default.
+func (c *Config) ProxySecretHeaderName() string {
+	if h := strings.TrimSpace(c.TrustedProxySecretHeader); h != "" {
+		return h
+	}
+	return DefaultTrustedProxySecretHeader
+}
+
+// ProxyAuthenticated reports whether a trusted proxy presented
+// trusted_proxy_secret (values are the secret header's values). With no
+// secret configured every trusted proxy is accepted (trusted_proxies alone).
+func (c *Config) ProxyAuthenticated(values []string) bool {
+	if c.TrustedProxySecret == "" {
+		return true
+	}
+	return utils.ProxySecretMatches(c.TrustedProxySecret, values)
+}
+
+// SessionIPBinding returns jwt_ip_binding with its default applied.
+func (c *Config) SessionIPBinding() string {
+	if c.JWTIPBinding == "" {
+		return JWTIPBindingPrefix
+	}
+	return c.JWTIPBinding
 }
 
 // SetTrustedProxies validates and installs trusted_proxies.

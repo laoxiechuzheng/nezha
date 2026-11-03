@@ -17,8 +17,9 @@ import (
 
 // ctxWithRealIP stores the TCP peer (CtxKeyConnectingIP) and the address the
 // WAF keys on (CtxKeyRealIP): the peer, or agent_real_ip_header when the peer
-// is a trusted proxy. The WAF itself is applied in authHandler.check, after
-// credentials are evaluated, so bans only ever come from gRPC auth failures.
+// is a trusted proxy (that also sent trusted_proxy_secret, when set). The WAF
+// itself is applied in authHandler.check, after credentials are evaluated, so
+// bans only ever come from gRPC auth failures.
 func ctxWithRealIP(ctx context.Context) (context.Context, error) {
 	var connectingIp string
 	var peerAddr netip.Addr
@@ -32,6 +33,12 @@ func ctxWithRealIP(ctx context.Context) (context.Context, error) {
 
 	header := singleton.Conf.AgentRealIPHeader
 	if header == model.ConfigUsePeerIP {
+		header = ""
+	}
+	// Same rule as the web: with trusted_proxy_secret set, the header only
+	// counts when the trusted proxy also sent the secret. Agents connecting
+	// directly send neither and are keyed on their peer address.
+	if header != "" && !singleton.Conf.ProxyAuthenticated(metadata.ValueFromIncomingContext(ctx, singleton.Conf.ProxySecretHeaderName())) {
 		header = ""
 	}
 	var vals []string

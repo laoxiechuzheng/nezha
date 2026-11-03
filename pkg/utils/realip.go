@@ -1,6 +1,8 @@
 package utils
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"fmt"
 	"net/netip"
 	"strings"
@@ -137,4 +139,33 @@ func ResolveClientIP(peer netip.Addr, header string, headerValues []string, trus
 		return leftmostTrusted, true
 	}
 	return peer, true
+}
+
+// ProxySecretMatches reports whether values carries exactly one value equal
+// to secret. It is the shared-secret check a trusted reverse proxy must pass
+// before its real-IP header is believed. Both sides are hashed first so the
+// comparison is constant time regardless of the presented length; an empty
+// secret never matches.
+func ProxySecretMatches(secret string, values []string) bool {
+	if secret == "" || len(values) != 1 {
+		return false
+	}
+	got := sha256.Sum256([]byte(strings.TrimSpace(values[0])))
+	want := sha256.Sum256([]byte(secret))
+	return subtle.ConstantTimeCompare(got[:], want[:]) == 1
+}
+
+// MaskAddr truncates ip to v4Bits (IPv4) or v6Bits (IPv6) leading bits.
+// Out of range values leave the address untouched. IPv4-mapped IPv6 is
+// treated as IPv4 and zones are dropped.
+func MaskAddr(ip netip.Addr, v4Bits, v6Bits int) netip.Addr {
+	ip = ip.Unmap().WithZone("")
+	bits := v6Bits
+	if ip.Is4() {
+		bits = v4Bits
+	}
+	if !ip.IsValid() || bits < 0 || bits >= ip.BitLen() {
+		return ip
+	}
+	return netip.PrefixFrom(ip, bits).Masked().Addr()
 }

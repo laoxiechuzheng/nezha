@@ -161,3 +161,30 @@ func TestCtxWithRealIP_HeaderFromTrustedProxyHonoured(t *testing.T) {
 		t.Fatalf("CtxKeyConnectingIP = %q, want 172.24.0.1", connIP)
 	}
 }
+
+// With trusted_proxy_secret set the gRPC header path needs the secret too;
+// agents connecting directly send neither and are keyed on their peer.
+func TestCtxWithRealIP_TrustedProxyNeedsSecret(t *testing.T) {
+	withTrustedProxies(t, "x-real-ip", "172.24.0.1/32")
+	singleton.Conf.TrustedProxySecret = "grpc-proxy-secret"
+
+	resolve := func(md metadata.MD) string {
+		t.Helper()
+		ctx, err := ctxWithRealIP(metadata.NewIncomingContext(peerCtx("172.24.0.1:40000"), md))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ip, _ := ctx.Value(model.CtxKeyRealIP{}).(string)
+		return ip
+	}
+
+	if got := resolve(metadata.Pairs("x-real-ip", "198.51.100.1")); got != "172.24.0.1" {
+		t.Fatalf("without secret got %q, want the peer", got)
+	}
+	if got := resolve(metadata.Pairs("x-real-ip", "198.51.100.1", "x-nezha-proxy-auth", "nope")); got != "172.24.0.1" {
+		t.Fatalf("wrong secret got %q, want the peer", got)
+	}
+	if got := resolve(metadata.Pairs("x-real-ip", "198.51.100.1", "x-nezha-proxy-auth", "grpc-proxy-secret")); got != "198.51.100.1" {
+		t.Fatalf("with secret got %q, want 198.51.100.1", got)
+	}
+}

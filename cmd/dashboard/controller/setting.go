@@ -107,6 +107,14 @@ func updateConfig(c *gin.Context) (any, error) {
 	singleton.Conf.DNSServers = sf.DNSServers
 	singleton.Conf.CustomCode = sf.CustomCode
 	singleton.Conf.CustomCodeDashboard = sf.CustomCodeDashboard
+	for _, w := range []string{
+		singleton.Conf.RealIPHeaderWarning("web_real_ip_header", singleton.Conf.WebRealIPHeader, sf.WebRealIPHeader),
+		singleton.Conf.RealIPHeaderWarning("agent_real_ip_header", singleton.Conf.AgentRealIPHeader, sf.AgentRealIPHeader),
+	} {
+		if w != "" {
+			log.Printf("NEZHA>> WARNING: %s", w)
+		}
+	}
 	singleton.Conf.WebRealIPHeader = sf.WebRealIPHeader
 	singleton.Conf.AgentRealIPHeader = sf.AgentRealIPHeader
 	singleton.Conf.AgentTLS = sf.AgentTLS

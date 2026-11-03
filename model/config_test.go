@@ -2,6 +2,7 @@ package model
 
 import (
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -274,4 +275,156 @@ func newTempConfig(t *testing.T, cfg string) string {
 	}
 
 	return file.Name()
+}
+
+func TestReadConfigWAFAndProxyKeys(t *testing.T) {
+	const cfg = `
+agent_secret_key: abcdefghijklmnopqrstuvwxyz012345
+trusted_proxies:
+  - 172.24.0.1/32
+  - 127.0.0.1
+trusted_proxy_secret: s3cr3t-value
+trusted_proxy_secret_header: X-Edge-Auth
+jwt_ip_binding: exact
+waf:
+  ipv6_prefix: 56
+  web:
+    max_block_seconds: 3600
+    reset_after_seconds: 86400
+`
+	file := newTempConfig(t, cfg)
+	defer os.Remove(file)
+	prev := CurrentWAFConfig()
+	defer SetWAFConfig(prev)
+
+	c := &Config{}
+	if err := c.Read(file, nil); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !reflect.DeepEqual(c.TrustedProxies, []string{"172.24.0.1/32", "127.0.0.1"}) {
+		t.Fatalf("trusted_proxies = %v", c.TrustedProxies)
+	}
+	if got := c.TrustedProxyPrefixes(); len(got) != 2 || got[0].String() != "172.24.0.1/32" || got[1].String() != "127.0.0.1/32" {
+		t.Fatalf("parsed trusted proxies = %v", got)
+	}
+	if c.TrustedProxySecret != "s3cr3t-value" || c.ProxySecretHeaderName() != "X-Edge-Auth" {
+		t.Fatalf("secret/header = %q/%q", c.TrustedProxySecret, c.ProxySecretHeaderName())
+	}
+	if c.SessionIPBinding() != JWTIPBindingExact {
+		t.Fatalf("jwt_ip_binding = %q", c.SessionIPBinding())
+	}
+	w := CurrentWAFConfig()
+	if w.IPv6Prefix != 56 || w.Web.MaxBlockSeconds != 3600 || w.Web.ResetAfterSeconds != 86400 {
+		t.Fatalf("waf = %+v", w)
+	}
+	if len(c.StartupWarnings()) != 0 {
+		t.Fatalf("unexpected warnings: %v", c.StartupWarnings())
+	}
+}
+
+func TestReadConfigProxyDefaultsAndScalarList(t *testing.T) {
+	file := newTempConfig(t, "agent_secret_key: abcdefghijklmnopqrstuvwxyz012345\ntrusted_proxies: 172.24.0.1/32, 10.0.0.0/8\n")
+	defer os.Remove(file)
+	prev := CurrentWAFConfig()
+	defer SetWAFConfig(prev)
+
+	c := &Config{}
+	if err := c.Read(file, nil); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got := c.TrustedProxyPrefixes(); len(got) != 2 || got[0].String() != "172.24.0.1/32" || got[1].String() != "10.0.0.0/8" {
+		t.Fatalf("scalar trusted_proxies parsed as %v", got)
+	}
+	if c.ProxySecretHeaderName() != DefaultTrustedProxySecretHeader {
+		t.Fatalf("default secret header = %q", c.ProxySecretHeaderName())
+	}
+	if c.SessionIPBinding() != JWTIPBindingPrefix {
+		t.Fatalf("default jwt_ip_binding = %q", c.SessionIPBinding())
+	}
+	if CurrentWAFConfig().ipv6Prefix() != 64 {
+		t.Fatalf("default ipv6 prefix = %d", CurrentWAFConfig().ipv6Prefix())
+	}
+	if !c.ProxyAuthenticated(nil) {
+		t.Fatal("with no trusted_proxy_secret every trusted proxy is accepted")
+	}
+}
+
+func TestReadConfigRejectsBadProxyKeys(t *testing.T) {
+	prev := CurrentWAFConfig()
+	defer SetWAFConfig(prev)
+	for _, cfg := range []string{
+		"jwt_ip_binding: strict\n",
+		"waf:\n  ipv6_prefix: 129\n",
+		"trusted_proxies: not-an-ip\n",
+	} {
+		file := newTempConfig(t, cfg)
+		if err := (&Config{}).Read(file, nil); err == nil {
+			t.Errorf("config %q must be rejected", cfg)
+		}
+		os.Remove(file)
+	}
+}
+
+func TestConfigStartupWarnings(t *testing.T) {
+	c := &Config{}
+	c.WebRealIPHeader = "X-Real-IP"
+	c.AgentSecretKey = "short"
+	ws := strings.Join(c.StartupWarnings(), "\n")
+	if !strings.Contains(ws, "trusted_proxy_secret is empty") || !strings.Contains(ws, "docker-proxy") {
+		t.Fatalf("missing real-ip header warning: %s", ws)
+	}
+	if !strings.Contains(ws, "agent_secret_key is only 5 characters") {
+		t.Fatalf("missing short agent secret warning: %s", ws)
+	}
+
+	c.TrustedProxySecret = "do-not-print-me"
+	c.AgentSecretKey = strings.Repeat("a", 32)
+	if ws := c.StartupWarnings(); len(ws) != 0 {
+		t.Fatalf("unexpected warnings: %v", ws)
+	}
+	c.WebRealIPHeader = ConfigUsePeerIP
+	c.TrustedProxySecret = ""
+	if ws := c.StartupWarnings(); len(ws) != 0 {
+		t.Fatalf("NZ::Use-Peer-IP is not a header: %v", ws)
+	}
+}
+
+func TestConfigRealIPHeaderWarning(t *testing.T) {
+	c := &Config{}
+	if w := c.RealIPHeaderWarning("web_real_ip_header", "", "X-Real-IP"); !strings.Contains(w, "trusted_proxies is empty") {
+		t.Fatalf("want warning, got %q", w)
+	}
+	if w := c.RealIPHeaderWarning("web_real_ip_header", "X-Real-IP", "X-Real-IP"); w != "" {
+		t.Fatalf("unchanged header must not warn: %q", w)
+	}
+	if w := c.RealIPHeaderWarning("web_real_ip_header", "X-Real-IP", ""); w != "" {
+		t.Fatalf("clearing the header must not warn: %q", w)
+	}
+	if err := c.SetTrustedProxies([]string{"172.24.0.1"}); err != nil {
+		t.Fatal(err)
+	}
+	if w := c.RealIPHeaderWarning("web_real_ip_header", "", "X-Real-IP"); w != "" {
+		t.Fatalf("configured trusted_proxies must not warn: %q", w)
+	}
+}
+
+func TestProxyAuthenticatedConstantTimeMatch(t *testing.T) {
+	c := &Config{TrustedProxySecret: "correct-secret"}
+	cases := []struct {
+		vals []string
+		want bool
+	}{
+		{nil, false},
+		{[]string{""}, false},
+		{[]string{"wrong"}, false},
+		{[]string{"correct-secret-but-longer"}, false},
+		{[]string{"correct-secret", "correct-secret"}, false},
+		{[]string{"correct-secret"}, true},
+		{[]string{" correct-secret "}, true},
+	}
+	for _, tc := range cases {
+		if got := c.ProxyAuthenticated(tc.vals); got != tc.want {
+			t.Errorf("ProxyAuthenticated(%q) = %v, want %v", tc.vals, got, tc.want)
+		}
+	}
 }

@@ -67,12 +67,12 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	// 不显式注册时，Gin 会走 NoRoute → fallbackToFrontend，对 MCP 客户端是 HTML/404。
 	r.GET("/mcp", mcpOriginGuard(), mcpMethodNotAllowed)
 	r.DELETE("/mcp", mcpOriginGuard(), mcpMethodNotAllowed)
-	r.GET("/mcp/download/:token", mcpOriginGuard(), transferDownloadHandler)
-	r.POST("/mcp/upload/:token", mcpOriginGuard(), transferUploadHandler)
+	r.GET("/mcp/download/:token", mcpTransferEnabledGuard(), mcpOriginGuard(), transferDownloadHandler)
+	r.POST("/mcp/upload/:token", mcpTransferEnabledGuard(), mcpOriginGuard(), transferUploadHandler)
 	registerAgentcompatRoutes(r)
 
 	api := r.Group("api/v1")
-	api.POST("/login", authMiddleware.LoginHandler)
+	api.POST("/login", loginGuard(), authMiddleware.LoginHandler)
 	api.GET("/oauth2/:provider", commonHandler(oauth2redirect))
 
 	fallbackAuthMw := fallbackAuthMiddleware(authMiddleware)

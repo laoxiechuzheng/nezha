@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"math/big"
+	"net/netip"
 	"sync/atomic"
 	"time"
 
@@ -73,9 +74,48 @@ type WAFConfig struct {
 	// attacker sharing an egress IP with a real agent cannot knock it offline.
 	// Agent secrets are 32 random alphanumerics, so the ban is not what keeps
 	// them from being guessed.
-	GRPCStrictBlock bool      `koanf:"grpc_strict_block" json:"grpc_strict_block,omitempty"`
-	Web             WAFPolicy `koanf:"web" json:"web"`
-	GRPC            WAFPolicy `koanf:"grpc" json:"grpc"`
+	GRPCStrictBlock bool `koanf:"grpc_strict_block" json:"grpc_strict_block,omitempty"`
+	// IPv6Prefix aggregates IPv6 clients into one WAF key per prefix, since
+	// a single host usually controls a whole /64 and could otherwise rotate
+	// addresses to reset its counter. 0 = 64, 128 = exact address. IPv4 is
+	// always keyed on the exact address. Applies to both scopes.
+	IPv6Prefix int       `koanf:"ipv6_prefix" json:"ipv6_prefix,omitempty"`
+	Web        WAFPolicy `koanf:"web" json:"web"`
+	GRPC       WAFPolicy `koanf:"grpc" json:"grpc"`
+}
+
+const defaultWAFIPv6Prefix = 64
+
+func (c WAFConfig) ipv6Prefix() int {
+	if c.IPv6Prefix <= 0 || c.IPv6Prefix > 128 {
+		return defaultWAFIPv6Prefix
+	}
+	return c.IPv6Prefix
+}
+
+// WAFKeyAddr maps a client address to the address its WAF rows are stored
+// under: IPv4 unchanged, IPv6 truncated to waf.ipv6_prefix.
+func WAFKeyAddr(ip netip.Addr) netip.Addr {
+	return utils.MaskAddr(ip, 32, CurrentWAFConfig().ipv6Prefix())
+}
+
+// WAFKey is WAFKeyAddr for a textual address; unparsable input is returned
+// unchanged so callers can still use it as an opaque key.
+func WAFKey(ip string) string {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return ip
+	}
+	return WAFKeyAddr(addr).String()
+}
+
+func wafKeyBinary(ip string) ([]byte, error) {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return nil, err
+	}
+	b := WAFKeyAddr(addr).As16()
+	return b[:], nil
 }
 
 var wafConfig atomic.Pointer[WAFConfig]
@@ -185,7 +225,7 @@ func CheckIP(db *gorm.DB, ip string, scope WAFScope) error {
 	if ip == "" {
 		return nil
 	}
-	ipBinary, err := utils.IPStringToBinary(ip)
+	ipBinary, err := wafKeyBinary(ip)
 	if err != nil {
 		return err
 	}
@@ -204,17 +244,22 @@ func CheckIP(db *gorm.DB, ip string, scope WAFScope) error {
 	return nil
 }
 
+// UnblockIP clears the counter of the client ip (mapped to its WAF key) for
+// identifier uid.
 func UnblockIP(db *gorm.DB, ip string, uid int64) error {
 	if ip == "" {
 		return nil
 	}
-	ipBinary, err := utils.IPStringToBinary(ip)
+	ipBinary, err := wafKeyBinary(ip)
 	if err != nil {
 		return err
 	}
 	return db.Unscoped().Delete(&WAF{}, "ip = ? and block_identifier = ?", ipBinary, uid).Error
 }
 
+// BatchUnblockIP removes rows by their stored key exactly as the admin WAF
+// list shows it (no prefix mapping, so rows written under an older
+// waf.ipv6_prefix can still be removed).
 func BatchUnblockIP(db *gorm.DB, ip []string) error {
 	if len(ip) < 1 {
 		return nil
@@ -231,11 +276,12 @@ func BatchUnblockIP(db *gorm.DB, ip []string) error {
 }
 
 // BlockIP records one failure (or a manual ban) for ip under identifier uid.
+// IPv6 addresses are aggregated to waf.ipv6_prefix.
 func BlockIP(db *gorm.DB, ip string, reason uint8, uid int64) error {
 	if ip == "" {
 		return nil
 	}
-	ipBinary, err := utils.IPStringToBinary(ip)
+	ipBinary, err := wafKeyBinary(ip)
 	if err != nil {
 		return err
 	}

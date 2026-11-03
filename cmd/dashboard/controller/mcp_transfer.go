@@ -363,6 +363,22 @@ func mintTransferTool(c *gin.Context, serverID uint64, path string, ttlSeconds i
 
 // --- HTTP handlers ---
 
+// mcpTransferEnabledGuard answers 404 for the one-time transfer URLs while
+// MCP is switched off, before token parsing or any audit write: with MCP off
+// no URL can be valid, and an unauthenticated scanner must not be able to
+// grow mcp_audit_log or learn that the endpoint exists. A URL minted before
+// the kill switch and consumed after it is therefore rejected here too
+// (revalidateTransferEntry still covers the race inside the handler).
+func mcpTransferEnabledGuard() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if singleton.Conf == nil || !singleton.Conf.MCPEnabled() {
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
+		c.Next()
+	}
+}
+
 // transferDownloadHandler 处理 GET /mcp/download/:token。
 // 走 IOStream 双向流：dashboard 把 agent 推过来的 chunk 转发给 HTTP 客户端，
 // 单文件 hard cap 100MiB（model.MCPFsTransferMaxSize）。

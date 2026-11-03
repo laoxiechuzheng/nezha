@@ -123,3 +123,32 @@ func TestResolveClientIPInvalidPeer(t *testing.T) {
 		t.Fatal("an unknown peer is never a trusted proxy, so its header must not be used")
 	}
 }
+
+func TestMaskAddr(t *testing.T) {
+	cases := []struct {
+		in     string
+		v4, v6 int
+		want   string
+	}{
+		{"198.51.100.77", 24, 64, "198.51.100.0"},
+		{"198.51.100.77", 32, 64, "198.51.100.77"},
+		{"::ffff:198.51.100.77", 24, 64, "198.51.100.0"},
+		{"2001:db8:1:2:3:4:5:6", 24, 64, "2001:db8:1:2::"},
+		{"2001:db8:1:2:3:4:5:6", 24, 128, "2001:db8:1:2:3:4:5:6"},
+		{"fe80::1%eth0", 24, 64, "fe80::"},
+	}
+	for _, tc := range cases {
+		if got := MaskAddr(netip.MustParseAddr(tc.in), tc.v4, tc.v6).String(); got != tc.want {
+			t.Errorf("MaskAddr(%s,%d,%d) = %s, want %s", tc.in, tc.v4, tc.v6, got, tc.want)
+		}
+	}
+}
+
+func TestProxySecretMatches(t *testing.T) {
+	if ProxySecretMatches("", []string{""}) {
+		t.Fatal("empty secret must never match")
+	}
+	if !ProxySecretMatches("abc", []string{"abc"}) || ProxySecretMatches("abc", []string{"abcd"}) || ProxySecretMatches("abc", []string{"abc", "abc"}) {
+		t.Fatal("unexpected match result")
+	}
+}
