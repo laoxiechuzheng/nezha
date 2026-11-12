@@ -1,12 +1,28 @@
 - path: "admin-dist"
-  name: "LaoxieAdmin"
+  name: "Signal Admin"
+  repository: "https://github.com/laoxiechuzheng/admin-frontend"
+  author: "laoxiechuzheng"
+  version: "v3.0.0-signal.1"
+  is_admin: true
+  is_official: true
+# Previous admin UI kept for rollback: set `admin_template: admin-classic-dist`
+# in data/config.yaml and restart the dashboard.
+- path: "admin-classic-dist"
+  name: "Classic Admin"
   repository: "https://github.com/laoxiechuzheng/admin-frontend"
   author: "laoxiechuzheng"
   version: "v2.3.5-laoxie.1"
   is_admin: true
   is_official: true
 - path: "user-dist"
-  name: "Official"
+  name: "Signal"
+  repository: "https://github.com/laoxiechuzheng/nezha-dash-v2"
+  author: "laoxiechuzheng"
+  version: "v3.0.0-signal.1"
+  is_official: true
+# Previous public UI kept for rollback: selectable in admin Settings as "Classic".
+- path: "user-classic-dist"
+  name: "Classic"
   repository: "https://github.com/laoxiechuzheng/nezha-dash-v2"
   author: "laoxiechuzheng"
   version: "v2.4.2-realtime.11"
