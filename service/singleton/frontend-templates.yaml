@@ -1,8 +1,8 @@
 - path: "admin-dist"
-  name: "Signal Admin"
+  name: "Lumen Admin"
   repository: "https://github.com/laoxiechuzheng/admin-frontend"
   author: "laoxiechuzheng"
-  version: "v3.0.0-signal.1"
+  version: "v3.0.0-lumen.1"
   is_admin: true
   is_official: true
 # Previous admin UI kept for rollback: set `admin_template: admin-classic-dist`
@@ -15,10 +15,10 @@
   is_admin: true
   is_official: true
 - path: "user-dist"
-  name: "Signal"
+  name: "Lumen"
   repository: "https://github.com/laoxiechuzheng/nezha-dash-v2"
   author: "laoxiechuzheng"
-  version: "v3.0.0-signal.1"
+  version: "v3.0.0-lumen.1"
   is_official: true
 # Previous public UI kept for rollback: selectable in admin Settings as "Classic".
 - path: "user-classic-dist"
